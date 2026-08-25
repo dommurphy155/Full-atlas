@@ -65,17 +65,12 @@ echo "==> Creating virtualenv..."
 PIP_LOG="$PROJECT_ROOT/data/logs"
 mkdir -p "$PIP_LOG"
 
-echo "==> Installing dependencies in the background (log: data/logs/pip-install.log)..."
 # rich is needed by the wizard itself — install it synchronously (tiny).
 ./.venv/bin/pip install --quiet --upgrade pip >"$PIP_LOG/pip-install.log" 2>&1
 ./.venv/bin/pip install --quiet rich >>"$PIP_LOG/pip-install.log" 2>&1
-# Everything else goes to the background; the wizard waits on it.
-./.venv/bin/pip install --quiet -r requirements.txt >>"$PIP_LOG/pip-install.log" 2>&1 &
-PIP_PID=$!
+# Everything else: the wizard kicks it off in the background and only gates
+# when services actually need it. The user keeps answering prompts meanwhile.
 
-# Deps finish inside the wizard (it waits on this PID and shows the log on
-# failure). Hand the PID over so state survives across the exec boundary.
-export ATLAS_PIP_PID="$PIP_PID"
 export ATLAS_PROJECT_ROOT="$PROJECT_ROOT"
 export ATLAS_OS="$OS"
 

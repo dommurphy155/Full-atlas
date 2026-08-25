@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
 
-from .paths import PROJECT_ROOT, DATA_DIR, atomic_write_600
+from .paths import PROJECT_ROOT, DATA_DIR, IS_LINUX, IS_MACOS, atomic_write_600
 from .process import _pid_alive
 from .service import get_backend, SERVICE_SPECS
 from .display import find_chrome
@@ -52,58 +52,141 @@ def _fail_with_log(step: str, log_path: Path) -> None:
     sys.exit(1)
 
 
-def wait_deps() -> None:
-    """Wait on the background pip started by install.sh."""
-    pip_pid = int(os.environ.get("ATLAS_PIP_PID", "0") or 0)
-    if not pip_pid:
-        # invoked directly without install.sh — run deps synchronously
-        venv_py = PROJECT_ROOT / ".venv" / "bin" / "python"
-        reqs = PROJECT_ROOT / "requirements.txt"
-        log_path = DATA_DIR / "logs" / "pip-install.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "wb") as lf:
-            r = subprocess.run(
-                [str(venv_py), "-m", "pip", "install", "-r", str(reqs)],
-                stdout=lf, stderr=subprocess.STDOUT,
-            )
-        if r.returncode != 0:
-            _fail_with_log("Dependency installation", log_path)
-        return
+def _total_ram_mb() -> int | None:
+    """Total system RAM in MB, or None if undetectable."""
+    try:
+        if IS_LINUX:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+        elif IS_MACOS:
+            out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True)
+            return int(out.stdout.strip()) // (1024 * 1024)
+    except Exception:
+        pass
+    return None
 
+
+IS_LOW_RAM = (_ram := _total_ram_mb()) is not None and _ram < 2048
+
+
+def _venv_py() -> Path:
+    return PROJECT_ROOT / ".venv" / "bin" / "python"
+
+
+_REQ_IMPORTS = ("fastapi", "uvicorn", "httpx", "orjson", "dotenv", "rich", "playwright", "patchright")
+
+
+def deps_satisfied() -> bool:
+    """Fast path: every requirement already importable in the venv?"""
+    py = _venv_py()
+    if not py.exists():
+        return False
+    probe = ";".join(f"import {m}" for m in _REQ_IMPORTS)
+    return subprocess.run([str(py), "-c", probe], capture_output=True).returncode == 0
+
+
+def start_deps_background() -> int | None:
+    """Ensure dependency installation is running in the background.
+
+    Returns the pip PID to wait on later, or None when nothing needs doing
+    (already satisfied / already running).
+    """
+    pip_pid = int(os.environ.get("ATLAS_PIP_PID", "0") or 0)
+    if pip_pid and _pid_alive(pip_pid):
+        console.print("[dim]⚙ Dependencies installing in the background...[/dim]")
+        return pip_pid
+
+    if deps_satisfied():
+        console.print("[green]✔ Dependencies already present (cached) — skipping install[/green]")
+        return None
+
+    py = _venv_py()
+    if not py.exists():
+        subprocess.run([sys.executable, "-m", "venv", str(PROJECT_ROOT / ".venv")], check=True)
+
+    log_path = DATA_DIR / "logs" / "pip-install.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+    if IS_LOW_RAM:
+        # Single-job builds: wheel compilation is the RAM spike on small boxes.
+        env["MAKEFLAGS"] = "-j1"
+        console.print("[yellow]⚠ Low RAM detected — using conservative install settings[/yellow]")
+    lf = open(log_path, "ab")
+    proc = subprocess.Popen(
+        [str(py), "-m", "pip", "install", "--quiet", "-r",
+         str(PROJECT_ROOT / "requirements.txt")],
+        stdout=lf, stderr=subprocess.STDOUT, env=env,
+        start_new_session=True,
+    )
+    console.print("[dim]⚙ Dependencies installing in the background (log: data/logs/pip-install.log)[/dim]")
+    return proc.pid
+
+
+def wait_deps(pip_pid: int | None) -> None:
+    """Gate: block until the background pip finishes. Only called right
+    before we actually need the deps (starting services)."""
+    if pip_pid is None:
+        return
     ok = False
     status = 0
     log_path = DATA_DIR / "logs" / "pip-install.log"
-    with console.status("[cyan]Installing dependencies..."):
+    with console.status("[cyan]Finishing dependency setup..."):
         while True:
             try:
                 pid, status = os.waitpid(pip_pid, os.WNOHANG)
             except ChildProcessError:
-                # Not our child (e.g. wizard re-invoked) — fall back to polling.
+                # Not our child (re-invoked wizard) — poll liveness instead.
                 while _pid_alive(pip_pid):
                     time.sleep(0.4)
-                ok = True  # exited without our supervision; assume success
+                ok = True
                 break
             if pid != 0:
                 break
             time.sleep(0.4)
     if ok is False:
         ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    # Belt & braces: verify imports even if pip claimed success.
+    # Metadata-only satisfaction (broken/partial installs) fools pip but not
+    # an import — retry once with --force-reinstall.
+    if ok and not deps_satisfied():
+        console.print("[yellow]⚠ Imports broken despite pip success — forcing reinstall...[/yellow]")
+        r2 = subprocess.run(
+            [str(_venv_py()), "-m", "pip", "install", "--quiet", "--force-reinstall",
+             "-r", str(PROJECT_ROOT / "requirements.txt")],
+            stdout=open(log_path, "ab"), stderr=subprocess.STDOUT,
+            env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+        )
+        ok = r2.returncode == 0 and deps_satisfied()
     if not ok:
         _fail_with_log("Dependency installation", log_path)
-    console.print("[green]✔ Dependencies installed[/green]")
+    console.print("[green]✔ Dependencies ready[/green]")
 
 
 def ensure_playwright_chromium() -> None:
-    """Needed only for the signup bots; skip quietly if it's already there."""
-    with console.status("[cyan]Ensuring Chromium for automation (may download)..."):
-        r = subprocess.run(
-            [str(PROJECT_ROOT / ".venv" / "bin" / "python"), "-m", "playwright", "install", "chromium"],
-            capture_output=True, text=True,
+    """Chromium download for the signup bots. Skipped on low-RAM machines
+    and never blocks the setup flow."""
+    if IS_LOW_RAM:
+        console.print(
+            "[yellow]⚠ Low RAM: skipping browser runtime download.[/yellow] "
+            "[dim]Run '.venv/bin/python -m playwright install chromium' before using the signup bots.[/dim]"
         )
-    if r.returncode == 0:
-        console.print("[green]✔ Browser runtime ready[/green]")
-    else:
-        console.print("[yellow]⚠ Browser runtime setup had issues — signup bots may need attention later[/yellow]")
+        return
+
+    def _done(proc: subprocess.Popen) -> None:
+        if proc.wait() == 0:
+            console.print("[green]✔ Browser runtime ready[/green]")
+
+    py = _venv_py()
+    proc = subprocess.Popen(
+        [str(py), "-m", "playwright", "install", "chromium"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    console.print("[dim]⚙ Browser runtime downloading in the background[/dim]")
+    # Watcher thread prints when done; never blocks the flow.
+    import threading
+    threading.Thread(target=_done, args=(proc,), daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +424,8 @@ def main() -> None:
     console.print(Panel(WELCOME, border_style="cyan", width=70))
     console.print()
 
-    wait_deps()
-    ensure_playwright_chromium()
+    # Deps install in the background — the user keeps going while pip works.
+    pip_pid = start_deps_background()
 
     console.print()
     console.print("[bold]Let's get you set up and developing.[/bold]")
@@ -361,6 +444,10 @@ def main() -> None:
             launch_cmd = fn()
 
     bootstrap_openrouter_key()
+
+    # First hard gate: services need real deps on disk.
+    wait_deps(pip_pid)
+    ensure_playwright_chromium()
     start_services()
     maybe_start_bots()
     mention_email_keys()

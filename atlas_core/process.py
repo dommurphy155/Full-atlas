@@ -31,6 +31,36 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+# Expected cmdline fragment per managed name. Guards against PID reuse:
+# a recycled PID almost never runs the same command.
+EXPECTED_CMDLINE: dict[str, str] = {
+    "proxy": "proxy.main",
+    "openrouter": "openrouter/scripts/scheduler.py",
+    "nvidia": "nvidia/scripts/main.py",
+    "huggingface": "hf_scheduler.py",
+}
+
+
+def _cmdline_matches(pid: int, fragment: str | None) -> bool:
+    """If we know what the process should run, verify /proc or ps agree."""
+    if not fragment:
+        return True
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return fragment in raw.replace(b"\x00", b" ").decode(errors="replace")
+    except OSError:
+        pass
+    # macOS / non-/proc fallback
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.returncode == 0 and fragment in out.stdout
+    except Exception:
+        return True  # can't verify — don't false-negative
+
+
 @dataclass
 class ProcSpec:
     name: str
@@ -58,13 +88,19 @@ class ManagedProcess:
         if pid is None or pid == os.getpid():
             return False
         if not _pid_alive(pid):
-            # stale pid file
-            try:
-                self.pid_file.unlink()
-            except OSError:
-                pass
+            self._clear()
+            return False
+        if not _cmdline_matches(pid, EXPECTED_CMDLINE.get(self.name)):
+            # PID alive but running something else -> recycled; stale file.
+            self._clear()
             return False
         return True
+
+    def _clear(self) -> None:
+        try:
+            self.pid_file.unlink()
+        except OSError:
+            pass
 
     def stop(self, timeout: float = 10.0) -> bool:
         """SIGTERM, wait, then SIGKILL. Returns True when nothing is left running."""
