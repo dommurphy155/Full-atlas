@@ -1,0 +1,8 @@
+# OpenRouter signup automation dependencies
+# Install with: pip install -r requirements.txt
+
+patchright>=1.51.0
+httpx>=0.27.0
+
+# Playwright browser binaries (installed via bootstrap or manually):
+#   python3 -m patchright install chromium

@@ -1,0 +1,33 @@
+[Unit]
+Description=OpenRouter Signup Automation
+After=network.target display-manager.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=__ATLAS_USER__
+Group=__ATLAS_USER__
+WorkingDirectory=__PROJECT_DIR__/openrouter/scripts
+Environment=DISPLAY=:1
+Environment=HOME=__ATLAS_HOME__
+Environment=PATH=__VENV_BIN__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=__VENV_PYTHON__ __PROJECT_DIR__/openrouter/scripts/scheduler.py --runs 0 --delay 240
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openrouter-signup
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=200%
+
+# Security - allow access to needed paths
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__PROJECT_DIR__/openrouter __VENV_DIR__ /tmp __PROJECT_DIR__/data /root/.hermes
+
+[Install]
+WantedBy=multi-user.target

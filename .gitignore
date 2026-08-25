@@ -1,0 +1,147 @@
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──
+.venv/
+venv/
+env/
+
+# ── IDE / editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Secrets & credentials ──
+# Live key files — never commit these
+**/keys.txt
+**/api_keys
+**/credentials.json
+**/*keys*.txt
+**/openroute_keys.txt
+**/nvda_keys.txt
+**/hf_keys.txt
+**/hc_cookies.json
+**/accounts.json
+**/tokens*.json
+**/sessions*.json
+**/cookies*.json
+captcha_cookie.json
+**/captcha_cookie.json
+
+# Key files with real tokens (pattern match)
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+
+# ── Environment files ──
+.env
+.env.*
+!.env.example
+
+# ── Chrome browser profiles (garbage, huge, sensitive) ──
+chrome_profiles/
+
+# ── Firefox browser profiles (garbage, huge, sensitive) ──
+**/.mozilla/
+data/firefox_profiles/
+**/firefox_profiles/
+
+# ── Runtime / state files ──
+*.db
+*.db-journal
+*-journal
+*.sqlite
+*.sqlite3
+*.pid
+*.sock
+*.log
+logs/
+.doctor/
+**/.doctor/
+
+# ── Proxy runtime ──
+proxy_stats.json
+data/proxy/runtime_config.json
+data/proxy_data/
+
+# ── Runtime data dirs ──
+data/*_data/
+**/.*_state.json
+
+# ── HuggingFace cookies ──
+data/huggingface/hc_cookies.json
+data/huggingface/hf_keys.txt
+
+# ── NVIDIA browser strength data ──
+data/nvidia/browser_strength/
+data/nvidia/accounts.json
+
+# ── Browser extensions (build artifacts) ──
+data/stealth-extension/
+
+# ── Test / cache artifacts ──
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ── OS junk ──
+.DS_Store
+Desktop.ini
+
+# ── Node (if any frontend gets added later) ──
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# ── Build / dist ──
+*.egg
+*.whl
+*.tar.gz
+*.zip
+
+# ── Plugin / session artifacts ──
+.plugin-config/
+atlas/.plugin-config/
+atlas/proxy/.plugin-config/
+huggingface/.plugin-config/
+.session-summary.md
+atlas/.session-summary.md
+atlas/session-summary.md
+
+# ── Claude share / HTML exports ──
+proxy/claude_share.html
+**/*_share.html
+*.html.bak
+
+# ── Misc temp ──
+*.tmp
+*.temp
+
+# ── Session/runtime junk ──
+.claude/
+git_diff.txt
+data/atlas_plan_hf.md
+proxy/connection_audit.txt
+proxy/data/
+
+# ── Secrets/runtime — never track ──
+data/hcaptcha_cookies.json
+data/captcha_cookie.json
+*.sqlite*

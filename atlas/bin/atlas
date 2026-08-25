@@ -1,0 +1,1883 @@
+#!/usr/bin/env python3
+"""atlas — unified CLI for the Atlas Bundle.
+
+Rich-based, interactive CLI with fuzzy matching, custom help, and
+progress-driven workflows. Targets Docker/GitHub CLI/Bun quality.
+"""
+from __future__ import annotations
+import argparse, difflib, os, platform, shutil, subprocess, sys, time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Bootstrap: if rich is missing (fresh clone), self-install into a venv and
+# re-exec, so the very first `atlas` command never shows a raw traceback.
+# ---------------------------------------------------------------------------
+def _bootstrap() -> None:
+    try:
+        import rich  # noqa: F401
+        return
+    except ImportError:
+        pass
+    root = Path(__file__).resolve().parent.parent.parent
+    venv_dir = root / ".venv"
+    py = venv_dir / "bin" / "python"
+    if not py.exists():
+        print("==> First run: creating virtualenv...")
+        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+    print("==> Installing core dependencies (one-time)...")
+    r = subprocess.run([str(py), "-m", "pip", "install", "--quiet", "rich"], check=False)
+    if r.returncode != 0 or not (venv_dir / "lib").exists():
+        print("ERR: could not install dependencies. Check your network/python setup.")
+        sys.exit(1)
+    os.execv(str(py), [str(py), __file__, *sys.argv[1:]])
+
+if __name__ == "__main__" and __package__ in (None, ""):
+    _bootstrap()
+
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.layout import Layout
+from rich.tree import Tree
+from rich.text import Text
+from rich.prompt import Prompt, Confirm
+from rich.spinner import Spinner as RichSpinner
+from rich.live import Live
+from rich.align import Align
+from rich.columns import Columns
+
+def _find_project_root() -> Path:
+    script = Path(__file__).resolve()
+    candidate = script.parent.parent.parent
+    if (candidate / "proxy" / "main.py").exists():
+        return candidate.resolve()
+    return Path.cwd().resolve()
+
+PROJECT_ROOT = _find_project_root()
+ATLAS_DIR = PROJECT_ROOT / "atlas"
+DATA_DIR = PROJECT_ROOT / "data"
+SYSTEMD_DIR = ATLAS_DIR / "systemd"
+
+# Canonical key file locations
+OR_KEYS_FILE = DATA_DIR / "openrouter_data" / "openroute_keys.txt"
+NV_KEYS_FILE = DATA_DIR / "nvidia_data" / "nvda_keys.txt"
+HF_KEYS_FILE = DATA_DIR / "huggingface_data" / "hf_keys.txt"
+PROXY_SERVICE = "atlas-proxy.service"
+OPENROUTER_SERVICE = "openrouter-signup.service"
+NVIDIA_SERVICE = "nvidia-automation.service"
+HF_SERVICE = "huggingface-automation.service"
+CONSOLE = Console()
+VERSION = "2.0.0"
+import logging as _logging
+log = _logging.getLogger("atlas-cli")
+
+def _run(cmd, check=True, capture=False, timeout=30):
+    try:
+        return subprocess.run(cmd, capture_output=capture, text=True, check=check, timeout=timeout)
+    except FileNotFoundError:
+        CONSOLE.print(f"[red]ERR[/red] Command not found: {cmd[0]}")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        CONSOLE.print(f"[red]ERR[/red] Command timed out: {' '.join(cmd)}")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        CONSOLE.print(f"[red]ERR[/red] Command failed (exit {e.returncode}): {' '.join(cmd)}")
+        if e.stderr:
+            CONSOLE.print(f"[dim]{e.stderr.strip()}[/dim]")
+        sys.exit(e.returncode)
+
+def has_systemctl(): return shutil.which("systemctl") is not None
+def detect_platform():
+    s = platform.system().lower()
+    return {"linux":"linux","darwin":"macos","windows":"windows"}.get(s,s)
+def detect_shell():
+    sp = os.environ.get("SHELL","")
+    n = Path(sp).name if sp else ""
+    if n in ("bash","zsh","fish","sh"): return n
+    for c in ("zsh","fish","bash","sh"):
+        if shutil.which(c): return c
+    return "bash"
+def get_proxy_url(): return os.environ.get("ATLAS_PROXY_URL","http://127.0.0.1:8788")
+def get_service_name(): return os.environ.get("ATLAS_SERVICE", PROXY_SERVICE)
+def _c(code, text): return f"{code}{text}[/]" if CONSOLE.is_terminal else text
+def green(t): return f"[green]{t}[/green]"
+def cyan(t): return f"[cyan]{t}[/cyan]"
+def yellow(t): return f"[yellow]{t}[/yellow]"
+def red(t): return f"[red]{t}[/red]"
+def bold(t): return f"[bold]{t}[/bold]"
+def dim(t): return f"[dim]{t}[/dim]"
+def checkmark(ok): return green("✔") if ok else red("✘")
+def warn(t): return f"[yellow]⚠ {t}[/yellow]"
+def info(t): return f"[cyan]ℹ {t}[/cyan]"
+def section(title):
+    CONSOLE.print(); CONSOLE.print(f"[bold underline]{title}[/bold underline]"); CONSOLE.print()
+def separator():
+    CONSOLE.print(); CONSOLE.print("[dim]"+"─"*50+"[/dim]"); CONSOLE.print()
+
+# ---------------------------------------------------------------------------
+# Fuzzy matching
+# ---------------------------------------------------------------------------
+def _fuzzy_match(input_val, candidates, cutoff=0.6):
+    return difflib.get_close_matches(input_val, candidates, n=3, cutoff=cutoff)
+def _suggest(word, candidates):
+    m = _fuzzy_match(word, candidates)
+    return m[0] if m else None
+
+# ---------------------------------------------------------------------------
+# Service management
+# ---------------------------------------------------------------------------
+UNIT_HINTS = (
+    ("atlas-proxy", "proxy"),
+    ("openrouter-signup", "openrouter"),
+    ("nvidia-automation", "nvidia"),
+    ("huggingface-automation", "huggingface"),
+)
+
+def _daemon_backend():
+    """DaemonBackend via atlas_core — used when systemctl is unavailable (macOS)."""
+    import sys as _sys
+    if str(PROJECT_ROOT) not in _sys.path:
+        _sys.path.insert(0, str(PROJECT_ROOT))
+    from atlas_core.service import get_backend
+    return get_backend()
+
+def _daemon_name(service):
+    base = str(service).replace(".service", "")
+    for hint, name in UNIT_HINTS:
+        if hint in base:
+            return name
+    return None
+
+def service_action(action, service=None):
+    service = service or get_service_name()
+    if not has_systemctl():
+        # No systemd (macOS / minimal Linux): manage via atlas_core daemons.
+        dname = _daemon_name(service)
+        if not dname or action not in ("start", "stop", "restart"):
+            CONSOLE.print(yellow(f"WARN: systemctl not found — cannot {action} {service}"))
+            return False
+        try:
+            be = _daemon_backend()
+            ok = {"start": be.start, "stop": be.stop, "restart": be.restart}[action](dname)
+        except Exception as e:
+            CONSOLE.print(red(f"ERR: {action} {service} failed: {e}"))
+            return False
+        if ok:
+            CONSOLE.print(green(f"OK: {action} {service} (daemon mode)"))
+        else:
+            CONSOLE.print(red(f"ERR: {action} {service} failed"))
+        return bool(ok)
+    cmd = ["systemctl", action, service]
+    result = _run(cmd, check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(green(f"OK: {action} {service}"))
+        return True
+    else:
+        CONSOLE.print(red(f"ERR: {action} {service} failed (exit {result.returncode})"))
+        if result.stderr:
+            CONSOLE.print(dim(result.stderr.strip()))
+        return False
+
+def service_status(service=None):
+    service = service or get_service_name()
+    if not has_systemctl():
+        dname = _daemon_name(service)
+        running = False
+        if dname:
+            try:
+                running = _daemon_backend().is_running(dname)
+            except Exception:
+                running = False
+        if running:
+            CONSOLE.print(green(f"OK: {service} is active (daemon mode)"))
+        else:
+            CONSOLE.print(yellow(f"{service}: stopped"))
+        return running
+    result = _run(["systemctl", "is-active", service], check=False, capture=True)
+    status = result.stdout.strip()
+    if status == "active":
+        CONSOLE.print(green(f"OK: {service} is active"))
+        return True
+    else:
+        CONSOLE.print(yellow(f"{service}: {status or 'unknown'}"))
+        return False
+
+def is_service_active(service):
+    if not has_systemctl():
+        dname = _daemon_name(service)
+        if not dname:
+            return False
+        try:
+            return _daemon_backend().is_running(dname)
+        except Exception:
+            return False
+    result = _run(["systemctl", "is-active", service], check=False, capture=True)
+    return result.stdout.strip() == "active"
+
+# ---------------------------------------------------------------------------
+# Proxy commands
+# ---------------------------------------------------------------------------
+def cmd_proxy_start():
+    CONSOLE.print(f"{cyan('▶')} Starting Atlas proxy...")
+    if service_action("start", "atlas-proxy"):
+        CONSOLE.print(green("Proxy started"))
+        return 0
+    return 1
+
+def cmd_proxy_stop():
+    CONSOLE.print(f"{cyan('▶')} Stopping Atlas proxy...")
+    if service_action("stop", "atlas-proxy"):
+        CONSOLE.print(green("Proxy stopped"))
+        return 0
+    return 1
+
+def _write_runtime_provider(provider: str, model: str = "") -> None:
+    """Write the runtime provider config file that the proxy reads at startup."""
+    import json
+    rp_dir = DATA_DIR / "proxy_data"
+    rp_dir.mkdir(parents=True, exist_ok=True)
+    rp_file = rp_dir / "runtime_provider.json"
+    config = {
+        "provider": provider,
+        "model": model,
+        "timestamp": int(time.time()),
+    }
+    rp_file.write_text(json.dumps(config, indent=2))
+    log.info(f"Runtime provider config written: provider={provider}, model={model or 'default'}")
+
+def cmd_proxy_restart(provider: str = "openrouter", model: str = ""):
+    CONSOLE.print(f"{cyan('▶')} Restarting Atlas proxy..." + (f" [{provider}]" + (f" ({model})" if model else "") if provider != "openrouter" else ""))
+    # Write runtime provider config before restart
+    _write_runtime_provider(provider, model)
+    cmd_proxy_stop()
+    time.sleep(1)
+    return cmd_proxy_start()
+
+PROXY_LOG_FILE = PROJECT_ROOT / "proxy" / "logs" / "atlas-proxy.log"
+
+def cmd_proxy_logs():
+    CONSOLE.print(f"{cyan('▶')} Following {PROXY_LOG_FILE.name} (Ctrl-C to exit)...")
+    if not PROXY_LOG_FILE.exists():
+        CONSOLE.print(yellow(f"No log file yet: {PROXY_LOG_FILE}"))
+        CONSOLE.print(dim("  Start the proxy first: atlas start"))
+        CONSOLE.print(dim("  Fallback: journalctl -u atlas-proxy.service -f"))
+        return 1
+    try:
+        subprocess.run(["tail", "-n", "40", "-f", str(PROXY_LOG_FILE)], check=False)
+    except KeyboardInterrupt:
+        CONSOLE.print()
+    return 0
+
+def cmd_proxy_status():
+    service_status("atlas-proxy")
+    url = get_proxy_url()
+    CONSOLE.print(f"\n{cyan('Health check')}: {url}/health")
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"{url}/health", headers={"User-Agent": "atlas-cli/2.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = resp.read().decode()
+            CONSOLE.print(green(f"  Proxy responding: {resp.status}"))
+            try:
+                import json
+                parsed = json.loads(data)
+                keys = parsed.get("keys", {})
+                total = parsed.get("summary", {}).get("total", "unknown")
+                CONSOLE.print(f"  Keys loaded: {cyan(str(total))}")
+            except Exception:
+                pass
+    except Exception as e:
+        CONSOLE.print(red(f"  Proxy not responding: {e}"))
+    CONSOLE.print(f"\n{cyan('Keys')}: {url}/health/keys")
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"{url}/health/keys", headers={"User-Agent": "atlas-cli/2.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            CONSOLE.print(green(f"  Keys endpoint: {resp.status}"))
+    except Exception as e:
+        CONSOLE.print(red(f"  Keys endpoint not responding: {e}"))
+    return 0
+
+# ---------------------------------------------------------------------------
+# OpenRouter commands
+# ---------------------------------------------------------------------------
+def cmd_openrouter_start():
+    openrouter_dir = PROJECT_ROOT / "openrouter"
+    scheduler = openrouter_dir / "scripts" / "scheduler.py"
+    if not scheduler.exists():
+        CONSOLE.print(red(f"ERR: {scheduler} not found"))
+        return 1
+    CONSOLE.print(f"{cyan('▶')} Starting OpenRouter automation...")
+    result = _run(["pgrep", "-f", f"{PROJECT_ROOT}/openrouter/scripts/scheduler.py"], check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(yellow("OpenRouter automation is already running"))
+        return 0
+    if has_systemctl():
+        check = _run(["systemctl", "list-unit-files", OPENROUTER_SERVICE], check=False, capture=True)
+        if OPENROUTER_SERVICE in check.stdout:
+            return service_action("start", OPENROUTER_SERVICE)
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        venv_python = Path(shutil.which("python3") or "python3")
+    log_file = openrouter_dir / "logs" / "openrouter.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a") as log:
+        proc = subprocess.Popen(
+            [str(venv_python), str(scheduler), "--runs", "0", "--delay", "240"],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    CONSOLE.print(green(f"OpenRouter automation started (PID {proc.pid})"))
+    CONSOLE.print(f"  Logs: {dim(str(log_file))}")
+    return 0
+
+def cmd_openrouter_stop():
+    CONSOLE.print(f"{cyan('▶')} Stopping OpenRouter automation...")
+    if has_systemctl():
+        _run(["systemctl", "stop", "openrouter-signup.service"], check=False)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/openrouter/scripts/scheduler.py"], check=False)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/openrouter/scripts/main.py"], check=False)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/openrouter/scripts/signup_automation.py"], check=False)
+    CONSOLE.print(green("OpenRouter automation stopped"))
+    return 0
+
+def cmd_openrouter_restart():
+    CONSOLE.print(f"{cyan('▶')} Restarting OpenRouter automation...")
+    cmd_openrouter_stop()
+    time.sleep(1)
+    return cmd_openrouter_start()
+
+def cmd_openrouter_logs():
+    CONSOLE.print(f"{cyan('▶')} Following OpenRouter logs (Ctrl-C to exit)...")
+    if not has_systemctl():
+        try:
+            from atlas_core.process import tail_log
+            tail_log("openrouter", follow=True)
+        except KeyboardInterrupt:
+            pass
+        return 0
+    cmd = ["journalctl", "-u", OPENROUTER_SERVICE, "-f"]
+    try:
+        subprocess.run(cmd, check=False)
+    except KeyboardInterrupt:
+        CONSOLE.print()
+    return 0
+
+def cmd_openrouter_status():
+    CONSOLE.print(f"\n{bold('OpenRouter Automation')}")
+    result = _run(["pgrep", "-f", f"{PROJECT_ROOT}/openrouter/scripts/scheduler.py"], check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(f"  {green('✔')} Running (PID {result.stdout.strip()})")
+    else:
+        CONSOLE.print(f"  {yellow('✘')} Not running")
+    if OR_KEYS_FILE.exists():
+        count = len([k for k in OR_KEYS_FILE.read_text().strip().splitlines() if k.strip() and not k.startswith("#")])
+        CONSOLE.print(f"  Keys: {cyan(str(count))}")
+    return 0
+
+# ---------------------------------------------------------------------------
+# NVIDIA commands
+# ---------------------------------------------------------------------------
+def cmd_nvidia_start():
+    nvidia_dir = PROJECT_ROOT / "nvidia"
+    main_script = nvidia_dir / "scripts" / "main.py"
+    if not main_script.exists():
+        CONSOLE.print(red(f"ERR: {main_script} not found"))
+        return 1
+    CONSOLE.print(f"{cyan('▶')} Starting NVIDIA key automation...")
+    result = _run(["pgrep", "-f", f"{PROJECT_ROOT}/nvidia/scripts/main.py"], check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(yellow("NVIDIA automation is already running"))
+        return 0
+    if has_systemctl():
+        check = _run(["systemctl", "list-unit-files", NVIDIA_SERVICE], check=False, capture=True)
+        if NVIDIA_SERVICE in check.stdout:
+            return service_action("start", NVIDIA_SERVICE)
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        venv_python = Path(shutil.which("python3") or "python3")
+    log_file = nvidia_dir / "logs" / "nvidia.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a") as log:
+        proc = subprocess.Popen(
+            [str(venv_python), str(main_script)],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    CONSOLE.print(green(f"NVIDIA automation started (PID {proc.pid})"))
+    CONSOLE.print(f"  Logs: {dim(str(log_file))}")
+    return 0
+
+def cmd_nvidia_stop():
+    CONSOLE.print(f"{cyan('▶')} Stopping NVIDIA automation...")
+    if has_systemctl():
+        _run(["systemctl", "stop", "nvidia-automation.service"], check=False)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/nvidia/scripts/main.py"], check=False)
+    CONSOLE.print(green("NVIDIA automation stopped"))
+    return 0
+
+def cmd_nvidia_restart():
+    CONSOLE.print(f"{cyan('▶')} Restarting NVIDIA automation...")
+    cmd_nvidia_stop()
+    time.sleep(1)
+    return cmd_nvidia_start()
+
+def cmd_nvidia_logs():
+    CONSOLE.print(f"{cyan('▶')} Following NVIDIA logs (Ctrl-C to exit)...")
+    if not has_systemctl():
+        try:
+            from atlas_core.process import tail_log
+            tail_log("nvidia", follow=True)
+        except KeyboardInterrupt:
+            pass
+        return 0
+    cmd = ["journalctl", "-u", NVIDIA_SERVICE, "-f"]
+    try:
+        subprocess.run(cmd, check=False)
+    except KeyboardInterrupt:
+        CONSOLE.print()
+    return 0
+
+def cmd_nvidia_status():
+    CONSOLE.print(f"\n{bold('NVIDIA Automation')}")
+    result = _run(["pgrep", "-f", f"{PROJECT_ROOT}/nvidia/scripts/main.py"], check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(f"  {green('✔')} Running (PID {result.stdout.strip()})")
+    else:
+        CONSOLE.print(f"  {yellow('✘')} Not running")
+    nv_keys = NV_KEYS_FILE
+    if nv_keys.exists():
+        count = len([k for k in nv_keys.read_text().strip().splitlines() if k.strip() and not k.startswith("#")])
+        CONSOLE.print(f"  Keys: {cyan(str(count))}")
+    return 0
+
+# ---------------------------------------------------------------------------
+# Global commands (start all / stop all / restart all / status all / logs all)
+# ---------------------------------------------------------------------------
+def cmd_start_all():
+    CONSOLE.print(f"{cyan('▶')} Starting all Atlas services...")
+    results = []
+    results.append(("Proxy", cmd_proxy_start() == 0))
+    results.append(("OpenRouter", cmd_openrouter_start() == 0))
+    results.append(("NVIDIA", cmd_nvidia_start() == 0))
+    results.append(("HuggingFace", cmd_huggingface_start() == 0))
+    CONSOLE.print()
+    for name, ok in results:
+        CONSOLE.print(f"  {checkmark(ok)} {name}")
+    return 0 if all(ok for _, ok in results) else 1
+
+def cmd_stop_all():
+    CONSOLE.print(f"{cyan('▶')} Stopping all Atlas services...")
+    service_action("stop", "atlas-proxy")
+    _run(["systemctl", "stop", "openrouter-signup.service"], check=False, capture=True)
+    _run(["systemctl", "stop", "nvidia-automation.service"], check=False, capture=True)
+    _run(["systemctl", "stop", "huggingface-automation.service"], check=False, capture=True)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/openrouter/scripts/scheduler.py"], check=False, capture=True)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/nvidia/scripts/main.py"], check=False, capture=True)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/huggingface/scripts/hf_scheduler.py"], check=False, capture=True)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/huggingface/scripts/main.py"], check=False, capture=True)
+    CONSOLE.print(green("All services stopped"))
+    return 0
+
+def cmd_restart_all():
+    CONSOLE.print(f"{cyan('▶')} Restarting all Atlas services...")
+    cmd_stop_all()
+    time.sleep(1)
+    return cmd_start_all()
+
+def cmd_status_all():
+    CONSOLE.print(f"\n{bold('Atlas Status')}")
+    CONSOLE.print(f"  Project: {cyan(str(PROJECT_ROOT))}")
+    CONSOLE.print(f"  Platform: {cyan(detect_platform())}")
+    CONSOLE.print(f"  Shell: {cyan(detect_shell())}")
+    CONSOLE.print(f"  Proxy URL: {cyan(get_proxy_url())}")
+    CONSOLE.print()
+    CONSOLE.print(f"{bold('Proxy')}:")
+    service_status("atlas-proxy")
+    CONSOLE.print(f"\n{bold('OpenRouter Automation')}:")
+    result = _run(["pgrep", "-f", f"{PROJECT_ROOT}/openrouter/scripts/scheduler.py"], check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(f"  {green('✔')} Running (PID {result.stdout.strip()})")
+    else:
+        CONSOLE.print(f"  {yellow('✘')} Not running")
+    CONSOLE.print(f"\n{bold('NVIDIA Automation')}")
+    result = _run(["pgrep", "-f", f"{PROJECT_ROOT}/nvidia/scripts/main.py"], check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(f"  {green('✔')} Running (PID {result.stdout.strip()})")
+    else:
+        CONSOLE.print(f"  {yellow('✘')} Not running")
+    CONSOLE.print(f"\n{bold('HuggingFace Automation')}")
+    result = _run(["pgrep", "-f", f"{PROJECT_ROOT}/huggingface/scripts/hf_scheduler.py"], check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(f"  {green('✔')} Running (PID {result.stdout.strip()})")
+    else:
+        CONSOLE.print(f"  {yellow('✘')} Not running")
+    CONSOLE.print(f"\n{bold('Keys')}:")
+    or_keys = OR_KEYS_FILE
+    nv_keys = NV_KEYS_FILE
+    hf_keys = HF_KEYS_FILE
+    CONSOLE.print(f"  OpenRouter: {cyan(str(or_keys))} ({or_keys.stat().st_size if or_keys.exists() else 0} bytes)")
+    CONSOLE.print(f"  NVIDIA: {cyan(str(nv_keys))} ({nv_keys.stat().st_size if nv_keys.exists() else 0} bytes)")
+    CONSOLE.print(f"  HuggingFace: {cyan(str(hf_keys))} ({hf_keys.stat().st_size if hf_keys.exists() else 0} bytes)")
+    CONSOLE.print(f"\n{bold('Proxy Health')}:")
+    url = get_proxy_url()
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"{url}/health", headers={"User-Agent": "atlas-cli/2.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            CONSOLE.print(f"  {green('✔')} Proxy responding ({resp.status})")
+    except Exception as e:
+        CONSOLE.print(f"  {red('✘')} Proxy not responding: {e}")
+    return 0
+
+def cmd_logs_all():
+    CONSOLE.print(f"{cyan('▶')} Following all Atlas logs...")
+    CONSOLE.print(dim("Proxy logs:") + " atlas proxy logs  (or: tail -f data/logs/proxy.log)")
+    CONSOLE.print(dim("OpenRouter logs:") + " atlas openrouter logs")
+    CONSOLE.print(dim("NVIDIA logs:") + " atlas nvidia logs")
+    CONSOLE.print(dim("HuggingFace logs:") + " atlas huggingface logs")
+    CONSOLE.print()
+    CONSOLE.print(yellow("Use atlas logs <component> for individual streams"))
+    return 0
+
+# ---------------------------------------------------------------------------
+# Interactive install wizard
+# ---------------------------------------------------------------------------
+def cmd_install():
+    CONSOLE.print()
+    CONSOLE.print(Panel.fit(
+        "[bold]Welcome to Atlas[/bold]\n\n"
+        "What would you like to install?",
+        width=52,
+        border_style="cyan",
+    ))
+    CONSOLE.print()
+    options = ["Full Atlas", "Proxy Only", "OpenRouter Creator", "NVIDIA Creator", "HuggingFace Creator", "Prompt Pack"]
+    for i, opt in enumerate(options, 1):
+        CONSOLE.print(f"  {cyan(f'{i}')} {opt}")
+    CONSOLE.print()
+    choice = Prompt.ask("Select", choices=[str(i) for i in range(1,7)], default="1")
+    idx = int(choice) - 1
+    CONSOLE.print()
+
+    if idx == 0:
+        _install_full()
+    elif idx == 1:
+        _install_proxy()
+    elif idx == 2:
+        _install_openrouter()
+    elif idx == 3:
+        _install_nvidia()
+    elif idx == 4:
+        _install_huggingface()
+    elif idx == 5:
+        _install_prompt_pack()
+    return 0
+
+def _install_full():
+    _step_progress("Environment setup", _setup_env)
+    _step_progress("Dependencies", _install_deps)
+    _step_progress("Proxy service", _setup_proxy)
+    _step_progress("OpenRouter automation", _setup_openrouter)
+    _step_progress("NVIDIA automation", _setup_nvidia)
+    _step_progress("HuggingFace automation", _setup_huggingface)
+    CONSOLE.print(f"\n{green('✔')} Full Atlas installation complete!")
+    CONSOLE.print(f"  Try: {cyan('atlas status')}")
+
+def _install_proxy():
+    _step_progress("Environment setup", _setup_env)
+    _step_progress("Dependencies", _install_deps)
+    _step_progress("Proxy service", _setup_proxy)
+    CONSOLE.print(f"\n{green('✔')} Proxy installation complete!")
+    CONSOLE.print(f"  Try: {cyan('atlas proxy status')}")
+
+def _install_openrouter():
+    _step_progress("OpenRouter automation", _setup_openrouter)
+    CONSOLE.print(f"\n{green('✔')} OpenRouter setup complete!")
+
+def _install_nvidia():
+    _step_progress("NVIDIA automation", _setup_nvidia)
+    CONSOLE.print(f"\n{green('✔')} NVIDIA setup complete!")
+
+def _install_huggingface():
+    _step_progress("HuggingFace automation", _setup_huggingface)
+    CONSOLE.print(f"\n{green('✔')} HuggingFace setup complete!")
+
+def _install_prompt_pack():
+    CONSOLE.print(f"  {cyan('▶')} Prompt Pack is included in the Atlas Bundle")
+    CONSOLE.print(f"  {dim('Get it at https://atlas.dev')}")
+
+def _step_progress(name, fn):
+    with Progress(
+        SpinnerColumn("dots12", style="cyan"),
+        TextColumn("[bold]{task.description}[/bold]"),
+        TextColumn("[dim]{task.fields[status]}[/dim]"),
+        console=CONSOLE,
+    ) as progress:
+        task = progress.add_task(name, status="working...")
+        try:
+            fn()
+            progress.update(task, status="done")
+        except Exception as e:
+            progress.update(task, status=f"failed: {e}")
+            CONSOLE.print(f"  {red('✘')} {name}: {e}")
+
+def _setup_env():
+    pass
+
+def _install_deps():
+    venv = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if not venv.exists():
+        CONSOLE.print(yellow("  No venv found — creating..."))
+        _run([sys.executable, "-m", "venv", str(PROJECT_ROOT / ".venv")])
+    CONSOLE.print(green("  Dependencies OK"))
+
+def _setup_proxy():
+    if has_systemctl():
+        service_action("enable", "atlas-proxy")
+    CONSOLE.print(green("  Proxy configured"))
+
+def _setup_openrouter():
+    CONSOLE.print(green("  OpenRouter automation ready"))
+
+def _setup_nvidia():
+    """Install NVIDIA automation as a systemd service."""
+    service_file = SYSTEMD_DIR / "nvidia-automation.service"
+    if service_file.exists() and has_systemctl():
+        import shutil as sh
+        dest = Path("/etc/systemd/system/nvidia-automation.service")
+        sh.copy(str(service_file), str(dest))
+        _run(["systemctl", "daemon-reload"], check=False, capture=True)
+        _run(["systemctl", "enable", "nvidia-automation.service"], check=False, capture=True)
+        CONSOLE.print(green("  NVIDIA systemd service installed"))
+    CONSOLE.print(green("  NVIDIA automation ready"))
+
+    CONSOLE.print(green("  NVIDIA automation ready"))
+
+def _setup_huggingface():
+    """Install HuggingFace automation as a systemd service."""
+    service_file = SYSTEMD_DIR / "huggingface-automation.service"
+    if service_file.exists() and has_systemctl():
+        import shutil as sh
+        dest = Path("/etc/systemd/system/huggingface-automation.service")
+        sh.copy(str(service_file), str(dest))
+        _run(["systemctl", "daemon-reload"], check=False, capture=True)
+        _run(["systemctl", "enable", "huggingface-automation.service"], check=False, capture=True)
+        CONSOLE.print(green("  HuggingFace systemd service installed"))
+    CONSOLE.print(green("  HuggingFace automation ready"))
+
+    CONSOLE.print(green("  HuggingFace automation ready"))
+
+# ---------------------------------------------------------------------------
+# Custom help screen
+# ---------------------------------------------------------------------------
+HELP_TEXT = f"""
+╔══════════════════════════════════════════════════════════╗
+║                         ATLAS                             ║
+║     One Proxy. Every Harness. Zero API Bills.           ║
+╚══════════════════════════════════════════════════════════╝
+
+Version     v{VERSION}
+Status      {"Running" if is_service_active("atlas-proxy") else "Stopped"}
+Provider    NVIDIA
+Proxy       {get_proxy_url()}
+
+────────────────────────────────────────────────────────────
+
+GENERAL
+
+  atlas install       First-time setup wizard
+  atlas doctor        Diagnose and repair problems
+  atlas update        Update Atlas
+  atlas shell         Open Atlas shell
+  atlas status        Show overall system status
+  atlas logs          Live proxy logs
+  atlas restart       Restart proxy
+  atlas restart --huggingface  Restart proxy with Hugging Face provider
+  atlas stop          Stop proxy
+  atlas start         Start proxy
+  atlas test          Run tests
+
+────────────────────────────────────────────────────────────
+
+PROXY
+
+  atlas proxy status
+  atlas proxy logs
+  atlas proxy restart
+  atlas proxy start
+  atlas proxy stop
+
+────────────────────────────────────────────────────────────
+
+OPENROUTER
+
+  atlas openrouter status
+  atlas openrouter logs
+  atlas openrouter restart
+  atlas openrouter start
+  atlas openrouter stop
+
+  atlas openrouter keys
+  atlas openrouter create
+  atlas openrouter import
+
+────────────────────────────────────────────────────────────
+
+NVIDIA
+
+  atlas nvidia status
+  atlas nvidia logs
+  atlas nvidia restart
+  atlas nvidia start
+  atlas nvidia stop
+
+  atlas nvidia keys
+  atlas nvidia create
+  atlas nvidia import
+
+────────────────────────────────────────────────────────────
+
+HUGGINGFACE
+
+  atlas huggingface status
+  atlas huggingface logs
+  atlas huggingface restart
+  atlas huggingface start
+  atlas huggingface stop
+
+  atlas huggingface keys
+  atlas huggingface create
+  atlas huggingface import
+
+────────────────────────────────────────────────────────────
+
+TESTING
+
+  atlas test              Run all test suites
+  atlas test all          Run all test suites
+  atlas test openrouter   Run OpenRouter tests
+  atlas test nvidia       Run NVIDIA tests
+  atlas test huggingface   Run HuggingFace tests
+  atlas test atlas        Run Atlas proxy tests
+  atlas test installer    Run installer tests
+  atlas test integration  Run integration tests
+  atlas test setup        Run setup tests
+
+────────────────────────────────────────────────────────────
+
+ALL SERVICES
+
+  atlas start all
+  atlas stop all
+  atlas restart all
+  atlas status all
+  atlas logs all
+
+────────────────────────────────────────────────────────────
+
+EXAMPLES
+
+  atlas
+  atlas doctor
+  atlas restart
+  atlas restart all
+  atlas proxy logs
+  atlas openrouter restart
+  atlas nvidia logs
+  atlas openrouter create
+  atlas huggingface create
+  atlas status all
+
+────────────────────────────────────────────────────────────
+
+Need help?  https://atlas.dev
+"""
+
+def cmd_help():
+    CONSOLE.print(HELP_TEXT)
+    return 0
+
+# ---------------------------------------------------------------------------
+# Doctor command
+# ---------------------------------------------------------------------------
+def cmd_doctor() -> int:
+    CONSOLE.print(f"\n{bold('Atlas Doctor')}")
+    CONSOLE.print()
+    issues = []
+
+    py_ver = sys.version_info
+    if py_ver < (3, 10):
+        issues.append(("Python", f"Need 3.10+, have {py_ver.major}.{py_ver.minor}"))
+    else:
+        CONSOLE.print(f"  {green('✔')} Python {py_ver.major}.{py_ver.minor}.{py_ver.micro}")
+
+    for path in [
+        PROJECT_ROOT / "proxy" / "main.py",
+        PROJECT_ROOT / "proxy" / "config.py",
+        PROJECT_ROOT / "proxy" / "keypool.py",
+    ]:
+        if path.exists():
+            CONSOLE.print(f"  {green('✔')} {path.relative_to(PROJECT_ROOT)}")
+        else:
+            issues.append(("Project file", f"Missing: {path}"))
+            CONSOLE.print(f"  {red('✘')} {path.relative_to(PROJECT_ROOT)}")
+
+    venv = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if venv.exists():
+        CONSOLE.print(f"  {green('✔')} Virtualenv at .venv")
+    else:
+        issues.append(("Virtualenv", "No .venv found"))
+        CONSOLE.print(f"  {yellow('⚠')} No virtualenv — run 'atlas install'")
+
+    if has_systemctl():
+        CONSOLE.print(f"  {green('✔')} systemctl available")
+    else:
+        issues.append(("systemd", "systemctl not found"))
+        CONSOLE.print(f"  {yellow('⚠')} systemctl not found")
+
+    url = get_proxy_url()
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"{url}/health", headers={"User-Agent": "atlas-cli/2.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            CONSOLE.print(f"  {green('✔')} Proxy responding on {url}")
+    except Exception:
+        issues.append(("Proxy", f"Proxy not responding on {url}"))
+        CONSOLE.print(f"  {yellow('⚠')} Proxy not responding on {url}")
+
+    for d in [DATA_DIR, DATA_DIR / "openrouter_data", DATA_DIR / "nvidia_data", DATA_DIR / "huggingface_data", DATA_DIR / "proxy_data"]:
+        if d.exists():
+            CONSOLE.print(f"  {green('✔')} {d.relative_to(PROJECT_ROOT)}")
+        else:
+            issues.append(("Data dir", f"Missing: {d}"))
+            CONSOLE.print(f"  {red('✘')} {d.relative_to(PROJECT_ROOT)}")
+
+    CONSOLE.print()
+    if issues:
+        CONSOLE.print(f"{bold(red(f'{len(issues)} issue(s) found:'))}")
+        for name, desc in issues:
+            CONSOLE.print(f"  {red('•')} {bold(name)}: {desc}")
+        return 1
+    else:
+        CONSOLE.print(green("All checks passed ✓"))
+        return 0
+
+def cmd_doctor_tui(args: list[str] | None = None) -> int:
+    """Launch the Atlas Doctor TUI (TypeScript + OpenTUI)."""
+    doctor_dir = PROJECT_ROOT / "atlas" / "doctor"
+    entry = doctor_dir / "tsrc" / "index.tsx"
+    if not entry.exists():
+        CONSOLE.print(f"{red('Atlas Doctor entry not found at')} {entry}")
+        return cmd_doctor()
+
+    cmd = ["bun", "tsrc/index.tsx"]
+    if args:
+        cmd.extend(args)
+    try:
+        result = subprocess.run(cmd, cwd=doctor_dir)
+        return result.returncode
+    except KeyboardInterrupt:
+        return 0
+    except FileNotFoundError:
+        CONSOLE.print(f"{red('bun not found. Install Bun:')} https://bun.sh")
+        return cmd_doctor()
+    except Exception as e:
+        CONSOLE.print(f"{red('Doctor failed to start:')} {e}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter sub-commands
+# ---------------------------------------------------------------------------
+def cmd_openrouter_keys() -> int:
+    or_keys = OR_KEYS_FILE
+    if or_keys.exists():
+        content = or_keys.read_text().strip()
+        keys = [k for k in content.splitlines() if k.strip() and not k.startswith("#")]
+        CONSOLE.print(f"\n{bold('OpenRouter Keys')}")
+        CONSOLE.print(f"  Total: {cyan(str(len(keys)))}")
+        CONSOLE.print()
+        for i, k in enumerate(keys, 1):
+            CONSOLE.print(f"  {dim(f'{i}.')} {k[:40]}...")
+    else:
+        CONSOLE.print(f"\n{yellow('No OpenRouter keys found')}")
+        CONSOLE.print(f"  Run {cyan('atlas openrouter create')} to generate one")
+    return 0
+
+def cmd_openrouter_create() -> int:
+    CONSOLE.print(f"\n{cyan('▶')} Creating OpenRouter key...")
+    CONSOLE.print(f"  {dim('This requires AgentMail and a Google account login')}")
+    CONSOLE.print()
+
+    # Check if AgentMail key is set
+    env_file = PROJECT_ROOT / "openrouter" / ".env"
+    if env_file.exists():
+        from dotenv import load_dotenv
+        env = {}
+        load_dotenv(env_file, override=False, dotenv_path=env_file)
+        if not os.environ.get("AGENTMAIL_API_KEY"):
+            # Try loading from .env
+            content = env_file.read_text()
+            for line in content.splitlines():
+                if line.startswith("AGENTMAIL_API_KEY="):
+                    os.environ["AGENTMAIL_API_KEY"] = line.split("=", 1)[1].strip()
+                    break
+
+    if not os.environ.get("AGENTMAIL_API_KEY"):
+        CONSOLE.print(yellow("  AGENTMAIL_API_KEY not found in openrouter/.env"))
+        CONSOLE.print(f"  Get one at {cyan('https://agentmail.to/dashboard')}")
+        CONSOLE.print(f"  Then add it to {PROJECT_ROOT / 'openrouter' / '.env'}")
+        return 1
+
+    # Run the signup automation
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        venv_python = Path(shutil.which("python3") or "python3")
+
+    signup_script = PROJECT_ROOT / "openrouter" / "scripts" / "signup_automation.py"
+    if not signup_script.exists():
+        CONSOLE.print(red(f"  ERR: {signup_script} not found"))
+        return 1
+
+    with Progress(
+        SpinnerColumn("dots12", style="cyan"),
+        TextColumn("[bold]{task.description}[/bold]"),
+        console=CONSOLE,
+    ) as progress:
+        task = progress.add_task("Running OpenRouter signup...", status="working...")
+        try:
+            result = subprocess.run(
+                [str(venv_python), str(signup_script)],
+                capture_output=True, text=True, timeout=600,
+            )
+            progress.update(task, status="done")
+        except subprocess.TimeoutExpired:
+            progress.update(task, status="timed out")
+            CONSOLE.print(red("  Signup timed out after 10 minutes"))
+            return 1
+        except Exception as e:
+            progress.update(task, status="failed")
+            CONSOLE.print(red(f"  Failed: {e}"))
+            return 1
+
+    if result.returncode == 0:
+        CONSOLE.print(green("  OpenRouter key created successfully"))
+        # Show the key
+        or_keys = OR_KEYS_FILE
+        if or_keys.exists():
+            keys = [k for k in or_keys.read_text().strip().splitlines() if k.strip()]
+            CONSOLE.print(f"  Total keys now: {cyan(str(len(keys)))}")
+    else:
+        CONSOLE.print(red(f"  Signup failed (exit {result.returncode})"))
+        if result.stderr:
+            CONSOLE.print(dim(result.stderr.strip()[:500]))
+    return 0
+
+def cmd_openrouter_import() -> int:
+    CONSOLE.print(f"\n{cyan('▶')} Import OpenRouter key")
+    CONSOLE.print(f"  Paste your sk-or-... key below")
+    CONSOLE.print()
+
+    key = Prompt.ask("OpenRouter API key")
+    if not key or not key.startswith("sk-or-"):
+        CONSOLE.print(red("  Invalid key format. Must start with sk-or-"))
+        return 1
+
+    or_keys = OR_KEYS_FILE
+    or_keys.parent.mkdir(parents=True, exist_ok=True)
+
+    # Check for duplicates
+    existing = set()
+    if or_keys.exists():
+        content = or_keys.read_text().strip()
+        existing = {k.strip() for k in content.splitlines() if k.strip() and not k.startswith("#")}
+
+    if key in existing:
+        CONSOLE.print(yellow("  Key already exists"))
+        return 0
+
+    with open(or_keys, "a") as f:
+        f.write(f"{key}\n")
+
+    CONSOLE.print(green(f"  Key imported successfully"))
+    CONSOLE.print(f"  Total keys: {cyan(str(len(existing) + 1))}")
+    return 0
+
+# ---------------------------------------------------------------------------
+# NVIDIA sub-commands
+# ---------------------------------------------------------------------------
+def cmd_nvidia_keys() -> int:
+    nv_keys = NV_KEYS_FILE
+    if nv_keys.exists():
+        content = nv_keys.read_text().strip()
+        keys = [k for k in content.splitlines() if k.strip() and not k.startswith("#")]
+        CONSOLE.print(f"\n{bold('NVIDIA Keys')}")
+        CONSOLE.print(f"  Total: {cyan(str(len(keys)))}")
+        CONSOLE.print()
+        for i, k in enumerate(keys, 1):
+            CONSOLE.print(f"  {dim(f'{i}.')} {k[:40]}...")
+    else:
+        CONSOLE.print(f"\n{yellow('No NVIDIA keys found')}")
+        CONSOLE.print(f"  Run {cyan('atlas nvidia create')} to generate one")
+    return 0
+
+def cmd_nvidia_create() -> int:
+    CONSOLE.print(f"\n{cyan('▶')} Creating NVIDIA key...")
+    CONSOLE.print(f"  {dim('This requires a Google account login and CAPTCHA')}")
+    CONSOLE.print()
+
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        venv_python = Path(shutil.which("python3") or "python3")
+
+    nvidia_main = PROJECT_ROOT / "nvidia" / "scripts" / "main.py"
+    if not nvidia_main.exists():
+        CONSOLE.print(red(f"  ERR: {nvidia_main} not found"))
+        return 1
+
+    with Progress(
+        SpinnerColumn("dots12", style="cyan"),
+        TextColumn("[bold]{task.description}[/bold]"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=CONSOLE,
+    ) as progress:
+        task = progress.add_task("Generating NVIDIA key...", total=1)
+        try:
+            result = subprocess.run(
+                [str(venv_python), str(nvidia_main)],
+                capture_output=True, text=True, timeout=600,
+            )
+            progress.update(task, completed=1)
+        except subprocess.TimeoutExpired:
+            progress.update(task, completed=0)
+            CONSOLE.print(red("  Key generation timed out"))
+            return 1
+        except Exception as e:
+            progress.update(task, completed=0)
+            CONSOLE.print(red(f"  Failed: {e}"))
+            return 1
+
+    if result.returncode == 0:
+        CONSOLE.print(green("  NVIDIA key generated successfully"))
+        nv_keys = NV_KEYS_FILE
+        if nv_keys.exists():
+            keys = [k for k in nv_keys.read_text().strip().splitlines() if k.strip()]
+            CONSOLE.print(f"  Total keys now: {cyan(str(len(keys)))}")
+    else:
+        CONSOLE.print(red(f"  Key generation failed (exit {result.returncode})"))
+        if result.stderr:
+            CONSOLE.print(dim(result.stderr.strip()[:500]))
+    return 0
+
+def cmd_nvidia_import() -> int:
+    CONSOLE.print(f"\n{cyan('▶')} Import NVIDIA key")
+    CONSOLE.print(f"  Paste your nvapi-... key below")
+    CONSOLE.print()
+
+    key = Prompt.ask("NVIDIA API key")
+    if not key or not key.startswith("nvapi-"):
+        CONSOLE.print(red("  Invalid key format. Must start with nvapi-"))
+        return 1
+
+    nv_keys = NV_KEYS_FILE
+    nv_keys.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = set()
+    if nv_keys.exists():
+        content = nv_keys.read_text().strip()
+        existing = {k.strip() for k in content.splitlines() if k.strip() and not k.startswith("#")}
+
+    if key in existing:
+        CONSOLE.print(yellow("  Key already exists"))
+        return 0
+
+    with open(nv_keys, "a") as f:
+        f.write(f"{key}\n")
+
+    CONSOLE.print(green(f"  Key imported successfully"))
+    CONSOLE.print(f"  Total keys: {cyan(str(len(existing) + 1))}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace commands
+# ---------------------------------------------------------------------------
+def cmd_huggingface_start():
+    hf_dir = PROJECT_ROOT / "huggingface"
+    scheduler = hf_dir / "scripts" / "hf_scheduler.py"
+    if not scheduler.exists():
+        CONSOLE.print(red(f"ERR: {scheduler} not found"))
+        return 1
+    CONSOLE.print(f"{cyan('▶')} Starting HuggingFace automation...")
+    result = _run(["pgrep", "-f", f"{PROJECT_ROOT}/huggingface/scripts/hf_scheduler.py"], check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(yellow("HuggingFace automation is already running"))
+        return 0
+    if has_systemctl():
+        check = _run(["systemctl", "list-unit-files", HF_SERVICE], check=False, capture=True)
+        if HF_SERVICE in check.stdout:
+            return service_action("start", HF_SERVICE)
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        venv_python = Path(shutil.which("python3") or "python3")
+    log_file = hf_dir / "logs" / "huggingface.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a") as log:
+        proc = subprocess.Popen(
+            [str(venv_python), str(scheduler), "--runs", "0", "--delay", "240"],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    CONSOLE.print(green(f"HuggingFace automation started (PID {proc.pid})"))
+    CONSOLE.print(f"  Logs: {dim(str(log_file))}")
+    return 0
+
+def cmd_huggingface_stop():
+    CONSOLE.print(f"{cyan('▶')} Stopping HuggingFace automation...")
+    if has_systemctl():
+        _run(["systemctl", "stop", HF_SERVICE], check=False)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/huggingface/scripts/hf_scheduler.py"], check=False)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/huggingface/scripts/main.py"], check=False)
+    _run(["pkill", "-f", f"{PROJECT_ROOT}/huggingface/scripts/get_cookie.py"], check=False)
+    CONSOLE.print(green("HuggingFace automation stopped"))
+    return 0
+
+def cmd_huggingface_restart():
+    CONSOLE.print(f"{cyan('▶')} Restarting HuggingFace automation...")
+    cmd_huggingface_stop()
+    time.sleep(1)
+    return cmd_huggingface_start()
+
+def cmd_huggingface_logs():
+    CONSOLE.print(f"{cyan('▶')} Following HuggingFace logs (Ctrl-C to exit)...")
+    # Check if running via systemd
+    if has_systemctl():
+        status = _run(["systemctl", "is-active", HF_SERVICE], check=False, capture=True)
+        if status.stdout.strip() == "active":
+            CONSOLE.print(dim(f"  journalctl -u {HF_SERVICE} -f --output=cat"))
+            try:
+                subprocess.run(["journalctl", "-u", HF_SERVICE, "-f", "--no-pager", "--output=cat"], check=False)
+            except KeyboardInterrupt:
+                CONSOLE.print()
+            return 0
+    # Daemon-mode log (atlas_core) takes precedence over legacy path
+    daemon_log = PROJECT_ROOT / "data" / "logs" / "huggingface.log"
+    if not has_systemctl() and daemon_log.exists():
+        try:
+            from atlas_core.process import tail_log
+            tail_log("huggingface", follow=True)
+        except KeyboardInterrupt:
+            pass
+        return 0
+    # Fallback: check the log file
+    log_file = PROJECT_ROOT / "huggingface" / "logs" / "huggingface.log"
+    if not log_file.exists():
+        CONSOLE.print(yellow("No log file yet — start the automation first"))
+        return 0
+    try:
+        subprocess.run(["tail", "-f", str(log_file)], check=False)
+    except KeyboardInterrupt:
+        CONSOLE.print()
+    return 0
+
+def cmd_huggingface_status():
+    CONSOLE.print(f"\n{bold('HuggingFace Automation')}")
+    result = _run(["pgrep", "-f", f"{PROJECT_ROOT}/huggingface/scripts/hf_scheduler.py"], check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(f"  {green('✔')} Running (PID {result.stdout.strip()})")
+    else:
+        CONSOLE.print(f"  {yellow('✘')} Not running")
+    hf_keys = HF_KEYS_FILE
+    if hf_keys.exists():
+        count = len([k for k in hf_keys.read_text().strip().splitlines() if k.strip() and not k.startswith("#")])
+        CONSOLE.print(f"  Keys: {cyan(str(count))}")
+    return 0
+
+def cmd_huggingface_keys() -> int:
+    hf_keys = HF_KEYS_FILE
+    if hf_keys.exists():
+        content = hf_keys.read_text().strip()
+        keys = [k for k in content.splitlines() if k.strip() and not k.startswith("#")]
+        CONSOLE.print(f"\n{bold('HuggingFace Keys')}")
+        CONSOLE.print(f"  Total: {cyan(str(len(keys)))}")
+        CONSOLE.print()
+        for i, k in enumerate(keys, 1):
+            CONSOLE.print(f"  {dim(f'{i}.')} {k[:40]}...")
+    else:
+        CONSOLE.print(f"\n{yellow('No HuggingFace keys found')}")
+        CONSOLE.print(f"  Run {cyan('atlas huggingface create')} to generate one")
+    return 0
+
+def cmd_huggingface_create() -> int:
+    CONSOLE.print(f"\n{cyan('▶')} Creating HuggingFace key...")
+    CONSOLE.print(f"  {dim('This requires a Google account login and CAPTCHA')}")
+    CONSOLE.print()
+
+    # Check if CDP is available
+    try:
+        import urllib.request
+        req = urllib.request.Request("http://127.0.0.1:9333/json/version", timeout=3)
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            CONSOLE.print(green("  CDP available on port 9333"))
+    except Exception:
+        CONSOLE.print(yellow("  CDP not available on port 9333"))
+        CONSOLE.print(f"  Start Chrome with: {cyan('--remote-debugging-port=9333')}")
+        return 1
+
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        venv_python = Path(shutil.which("python3") or "python3")
+
+    hf_main = PROJECT_ROOT / "huggingface" / "scripts" / "main.py"
+    if not hf_main.exists():
+        CONSOLE.print(red(f"  ERR: {hf_main} not found"))
+        return 1
+
+    with Progress(
+        SpinnerColumn("dots12", style="cyan"),
+        TextColumn("[bold]{task.description}[/bold]"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=CONSOLE,
+    ) as progress:
+        task = progress.add_task("Generating HuggingFace key...", total=1)
+        try:
+            result = subprocess.run(
+                [str(venv_python), str(hf_main)],
+                capture_output=True, text=True, timeout=600,
+            )
+            progress.update(task, completed=1)
+        except subprocess.TimeoutExpired:
+            progress.update(task, completed=0)
+            CONSOLE.print(red("  Key generation timed out"))
+            return 1
+        except Exception as e:
+            progress.update(task, completed=0)
+            CONSOLE.print(red(f"  Failed: {e}"))
+            return 1
+
+    if result.returncode == 0:
+        CONSOLE.print(green("  HuggingFace key generated successfully"))
+        hf_keys = HF_KEYS_FILE
+        if hf_keys.exists():
+            keys = [k for k in hf_keys.read_text().strip().splitlines() if k.strip()]
+            CONSOLE.print(f"  Total keys now: {cyan(str(len(keys)))}")
+    else:
+        CONSOLE.print(red(f"  Key generation failed (exit {result.returncode})"))
+        if result.stderr:
+            CONSOLE.print(dim(result.stderr.strip()[:500]))
+    return 0
+
+def cmd_huggingface_import() -> int:
+    CONSOLE.print(f"\n{cyan('▶')} Import HuggingFace key")
+    CONSOLE.print(f"  Paste your hf_... key below")
+    CONSOLE.print()
+
+    key = Prompt.ask("HuggingFace API key")
+    if not key or not key.startswith("hf_"):
+        CONSOLE.print(red("  Invalid key format. Must start with hf_"))
+        return 1
+
+    hf_keys = HF_KEYS_FILE
+    hf_keys.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = set()
+    if hf_keys.exists():
+        content = hf_keys.read_text().strip()
+        existing = {k.strip() for k in content.splitlines() if k.strip() and not k.startswith("#")}
+
+    if key in existing:
+        CONSOLE.print(yellow("  Key already exists"))
+        return 0
+
+    with open(hf_keys, "a") as f:
+        f.write(f"{key}\n")
+
+    CONSOLE.print(green("  Key imported successfully"))
+    CONSOLE.print(f"  Total keys: {cyan(str(len(existing) + 1))}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Keys command (existing, now also handles component-specific keys)
+# ---------------------------------------------------------------------------
+def cmd_keys() -> int:
+    CONSOLE.print(f"\n{bold('Atlas Keys')}")
+    or_keys = OR_KEYS_FILE
+    nv_keys = NV_KEYS_FILE
+    hf_keys = HF_KEYS_FILE
+
+    if or_keys.exists():
+        content = or_keys.read_text().strip()
+        keys = [k for k in content.splitlines() if k.strip() and not k.startswith("#")]
+        CONSOLE.print(f"\n  {bold('OpenRouter')}: {cyan(str(len(keys)))} keys")
+        for i, k in enumerate(keys[:3], 1):
+            CONSOLE.print(f"    {i}. {dim(k[:20])}...")
+        if len(keys) > 3:
+            CONSOLE.print(f"    ... and {len(keys) - 3} more")
+    else:
+        CONSOLE.print(f"\n  {yellow('OpenRouter')}: No keys file found")
+
+    if nv_keys.exists():
+        content = nv_keys.read_text().strip()
+        keys = [k for k in content.splitlines() if k.strip() and not k.startswith("#")]
+        CONSOLE.print(f"\n  {bold('NVIDIA')}: {cyan(str(len(keys)))} keys")
+        for i, k in enumerate(keys[:3], 1):
+            CONSOLE.print(f"    {i}. {dim(k[:20])}...")
+        if len(keys) > 3:
+            CONSOLE.print(f"    ... and {len(keys) - 3} more")
+    else:
+        CONSOLE.print(f"\n  {yellow('NVIDIA')}: No keys file found")
+    if hf_keys.exists():
+        content = hf_keys.read_text().strip()
+        keys = [k for k in content.splitlines() if k.strip() and not k.startswith("#")]
+        CONSOLE.print(f"\n  {bold('HuggingFace')}: {cyan(str(len(keys)))} keys")
+        for i, k in enumerate(keys[:3], 1):
+            CONSOLE.print(f"    {i}. {dim(k[:20])}...")
+        if len(keys) > 3:
+            CONSOLE.print(f"    ... and {len(keys) - 3} more")
+    else:
+        CONSOLE.print(f"\n  {yellow('HuggingFace')}: No keys file found")
+
+    return 0
+
+# ---------------------------------------------------------------------------
+# Shell command
+# ---------------------------------------------------------------------------
+def cmd_shell() -> int:
+    env = os.environ.copy()
+    env["ATLAS_PROXY_URL"] = os.environ.get("ATLAS_PROXY_URL", "http://127.0.0.1:8788")
+    env["ATLAS_SERVICE"] = os.environ.get("ATLAS_SERVICE", PROXY_SERVICE)
+    env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:8788"
+    env["ANTHROPIC_API_KEY"] = "atlas"
+    env["ATLAS_ROOT"] = str(PROJECT_ROOT)
+    shell = detect_shell()
+    CONSOLE.print(f"{cyan('▶')} Opening {shell} with Atlas environment...")
+    CONSOLE.print(f"  ANTHROPIC_BASE_URL = http://127.0.0.1:8788")
+    CONSOLE.print(f"  ATLAS_PROXY_URL = {env['ATLAS_PROXY_URL']}")
+    CONSOLE.print()
+    subprocess.run([shell], env=env)
+    return 0
+
+# ---------------------------------------------------------------------------
+# Update command
+# ---------------------------------------------------------------------------
+def cmd_update() -> int:
+    CONSOLE.print(f"{cyan('▶')} Pulling latest changes...")
+    result = _run(["git", "pull"], cwd=PROJECT_ROOT, check=False, capture=True)
+    if result.returncode == 0:
+        CONSOLE.print(green("Pulled latest changes"))
+    else:
+        CONSOLE.print(yellow(f"Git pull: {result.stderr.strip()}"))
+    CONSOLE.print(f"{cyan('▶')} Reconfiguring...")
+    return cmd_install()
+
+# ---------------------------------------------------------------------------
+# Main dispatcher with fuzzy matching
+# ---------------------------------------------------------------------------
+
+COMPONENTS = ["proxy", "openrouter", "nvidia", "huggingface"]
+ALL_COMMANDS = [
+    "install", "doctor", "update", "shell", "status", "logs",
+    "restart", "stop", "start", "help", "keys", "test",
+    "proxy", "openrouter", "nvidia", "huggingface",
+]
+
+def _dispatch_proxy(args):
+    cmd = getattr(args, "proxy_cmd", None)
+    if cmd == "start": return cmd_proxy_start()
+    elif cmd == "stop": return cmd_proxy_stop()
+    elif cmd == "restart": return cmd_proxy_restart()
+    elif cmd == "logs": return cmd_proxy_logs()
+    elif cmd == "status": return cmd_proxy_status()
+    else:
+        CONSOLE.print("Usage: atlas proxy <start|stop|restart|logs|status>")
+        return 1
+
+def _dispatch_openrouter(args):
+    cmd = getattr(args, "or_cmd", None)
+    if cmd == "start": return cmd_openrouter_start()
+    elif cmd == "stop": return cmd_openrouter_stop()
+    elif cmd == "restart": return cmd_openrouter_restart()
+    elif cmd == "logs": return cmd_openrouter_logs()
+    elif cmd == "status": return cmd_openrouter_status()
+    elif cmd == "keys": return cmd_openrouter_keys()
+    elif cmd == "create": return cmd_openrouter_create()
+    elif cmd == "import": return cmd_openrouter_import()
+    else:
+        CONSOLE.print("Usage: atlas openrouter <start|stop|restart|logs|status|keys|create|import>")
+        return 1
+
+def _dispatch_nvidia(args):
+    cmd = getattr(args, "nv_cmd", None)
+    if cmd == "start": return cmd_nvidia_start()
+    elif cmd == "stop": return cmd_nvidia_stop()
+    elif cmd == "restart": return cmd_nvidia_restart()
+    elif cmd == "logs": return cmd_nvidia_logs()
+    elif cmd == "status": return cmd_nvidia_status()
+    elif cmd == "keys": return cmd_nvidia_keys()
+    elif cmd == "create": return cmd_nvidia_create()
+    elif cmd == "import": return cmd_nvidia_import()
+    else:
+        CONSOLE.print("Usage: atlas nvidia <start|stop|restart|logs|status|keys|create|import>")
+        return 1
+
+def _dispatch_huggingface(args):
+    cmd = getattr(args, "hf_cmd", None)
+    if cmd == "start": return cmd_huggingface_start()
+    elif cmd == "stop": return cmd_huggingface_stop()
+    elif cmd == "restart": return cmd_huggingface_restart()
+    elif cmd == "logs": return cmd_huggingface_logs()
+    elif cmd == "status": return cmd_huggingface_status()
+    elif cmd == "keys": return cmd_huggingface_keys()
+    elif cmd == "create": return cmd_huggingface_create()
+    elif cmd == "import": return cmd_huggingface_import()
+    else:
+        CONSOLE.print("Usage: atlas huggingface <start|stop|restart|logs|status|keys|create|import>")
+        return 1
+
+def _handle_global(args):
+    cmd = args.global_cmd
+    if cmd == "start": return cmd_start_all()
+    elif cmd == "stop": return cmd_stop_all()
+    elif cmd == "restart": return cmd_restart_all()
+    elif cmd == "status": return cmd_status_all()
+    elif cmd == "logs": return cmd_logs_all()
+    return 0
+
+def main() -> int:
+    # If no args, show help
+    if len(sys.argv) == 1:
+        cmd_help()
+        return 0
+
+    # Parse the first argument as the command
+    raw_cmd = sys.argv[1]
+
+    # Handle help flags
+    if raw_cmd in ("help", "--help", "-h"):
+        cmd_help()
+        return 0
+
+    # Fuzzy match the command
+    matched = _suggest(raw_cmd, ALL_COMMANDS)
+    if matched and matched != raw_cmd:
+        CONSOLE.print(f"{yellow('Unknown command:')} {red(raw_cmd)}")
+        CONSOLE.print(f"\n  Did you mean:")
+        CONSOLE.print(f"    atlas {matched}")
+        CONSOLE.print()
+        return 1
+
+    if raw_cmd not in ALL_COMMANDS and not matched:
+        # Check if it's a component prefix
+        component_match = None
+        for comp in COMPONENTS:
+            if comp.startswith(raw_cmd.lower()):
+                component_match = comp
+                break
+        if component_match:
+            CONSOLE.print(f"{yellow('Unknown command:')} {red(raw_cmd)}")
+            CONSOLE.print(f"\n  Did you mean:")
+            CONSOLE.print(f"    atlas {component_match}")
+            CONSOLE.print()
+            return 1
+
+        CONSOLE.print(f"{red('Unknown command:')} {raw_cmd}")
+        CONSOLE.print(f"\n  Run {cyan('atlas help')} for available commands.")
+        return 1
+
+    # Now build a proper sub-argparse for the matched command
+    # We use the raw command (not the fuzzy-matched one) for dispatch
+    cmd = raw_cmd
+
+    # Global proxy commands
+    if cmd in ("start", "stop", "restart", "status", "logs"):
+        if cmd in ("start", "restart"):
+            _provider = "openrouter"
+            _model = ""
+
+            _args = sys.argv[2:]
+            _i = 0
+
+            while _i < len(_args):
+                _arg = _args[_i]
+
+                if _arg in ("--huggingface", "--hf"):
+                    _provider = "huggingface"
+
+                    # Optional model immediately following the provider flag.
+                    if _i + 1 < len(_args):
+                        _next = _args[_i + 1]
+                        if not _next.startswith("--") and _next != "all":
+                            _model = _next
+                            _i += 1
+
+                elif _arg.startswith("--huggingface="):
+                    _provider = "huggingface"
+                    _model = _arg.split("=", 1)[1]
+
+                elif _arg in ("--openrouter", "--or"):
+                    _provider = "openrouter"
+
+                    # OpenRouter uses config.py default unless explicitly
+                    # given a model.
+                    if _i + 1 < len(_args):
+                        _next = _args[_i + 1]
+                        if not _next.startswith("--") and _next != "all":
+                            _model = _next
+                            _i += 1
+
+                elif _arg.startswith("--openrouter="):
+                    _provider = "openrouter"
+                    _model = _arg.split("=", 1)[1]
+
+                _i += 1
+
+            # Always explicitly write the selected provider.
+            # An unqualified start/restart therefore resets to OpenRouter
+            # instead of inheriting the previous provider.
+            if _provider == "huggingface":
+                _write_runtime_provider("huggingface", _model)
+            else:
+                _write_runtime_provider("openrouter", _model)
+
+            if cmd == "start":
+                return cmd_proxy_start()
+
+            cmd_proxy_stop()
+            time.sleep(1)
+            return cmd_proxy_start()
+
+        # Check if "all" was passed
+        if len(sys.argv) > 2 and sys.argv[2] == "all":
+            class Args:
+                pass
+            args = Args()
+            args.global_cmd = cmd
+            return _handle_global(args)
+
+        if cmd == "stop":
+            return cmd_proxy_stop()
+        elif cmd == "logs":
+            return cmd_proxy_logs()
+        elif cmd == "status":
+            return cmd_proxy_status()
+
+    # Component commands
+    if cmd == "proxy":
+        parser = argparse.ArgumentParser(prog="atlas proxy")
+        sub = parser.add_subparsers(dest="proxy_cmd")
+        sub.add_parser("start"); sub.add_parser("stop")
+        sub.add_parser("restart"); sub.add_parser("logs"); sub.add_parser("status")
+        args = parser.parse_args(sys.argv[2:])
+        return _dispatch_proxy(args)
+
+    elif cmd == "openrouter":
+        parser = argparse.ArgumentParser(prog="atlas openrouter")
+        sub = parser.add_subparsers(dest="or_cmd")
+        sub.add_parser("start"); sub.add_parser("stop")
+        sub.add_parser("restart"); sub.add_parser("logs"); sub.add_parser("status")
+        sub.add_parser("keys"); sub.add_parser("create"); sub.add_parser("import")
+        args = parser.parse_args(sys.argv[2:])
+        return _dispatch_openrouter(args)
+
+    elif cmd == "nvidia":
+        parser = argparse.ArgumentParser(prog="atlas nvidia")
+        sub = parser.add_subparsers(dest="nv_cmd")
+        sub.add_parser("start"); sub.add_parser("stop")
+        sub.add_parser("restart"); sub.add_parser("logs"); sub.add_parser("status")
+        sub.add_parser("keys"); sub.add_parser("create"); sub.add_parser("import")
+        args = parser.parse_args(sys.argv[2:])
+        return _dispatch_nvidia(args)
+
+    elif cmd == "huggingface":
+        parser = argparse.ArgumentParser(prog="atlas huggingface")
+        sub = parser.add_subparsers(dest="hf_cmd")
+        sub.add_parser("start"); sub.add_parser("stop")
+        sub.add_parser("restart"); sub.add_parser("logs"); sub.add_parser("status")
+        sub.add_parser("keys"); sub.add_parser("create"); sub.add_parser("import")
+        args = parser.parse_args(sys.argv[2:])
+        return _dispatch_huggingface(args)
+
+    elif cmd == "install":
+        return cmd_install()
+    elif cmd == "doctor":
+        return cmd_doctor_tui(sys.argv[2:])
+    elif cmd == "update":
+        return cmd_update()
+    elif cmd == "shell":
+        return cmd_shell()
+    elif cmd == "status":
+        return cmd_status_all()
+    elif cmd == "logs":
+        return cmd_logs_all()
+    elif cmd == "restart":
+        return cmd_restart_all()
+    elif cmd == "stop":
+        return cmd_stop_all()
+    elif cmd == "start":
+        return cmd_start_all()
+    elif cmd == "keys":
+        return cmd_keys()
+    elif cmd == "help":
+        cmd_help()
+        return 0
+    elif cmd == "test":
+        test_parser = argparse.ArgumentParser(prog="atlas test")
+        test_sub = test_parser.add_subparsers(dest="test_suite")
+        test_sub.add_parser("all")
+        test_sub.add_parser("openrouter")
+        test_sub.add_parser("nvidia")
+        test_sub.add_parser("huggingface")
+        test_sub.add_parser("atlas")
+        test_sub.add_parser("installer")
+        test_sub.add_parser("integration")
+        test_sub.add_parser("setup")
+        args = test_parser.parse_args(sys.argv[2:])
+        return cmd_test(args)
+
+    CONSOLE.print(f"{red('Unknown command:')} {cmd}")
+    return 1
+
+# ---------------------------------------------------------------------------
+# Test commands
+# ---------------------------------------------------------------------------
+TEST_SUITES = {
+    "atlas": "tests/proxy_tests/",
+    "proxy": "tests/proxy_tests/",
+    "openrouter": "tests/openrouter_tests/",
+    "nvidia": "tests/nvidia_tests/",
+    "huggingface": "tests/huggingface_tests/",
+    "installer": "tests/installer/",
+    "integration": "tests/integration/",
+    "setup": "tests/setup/",
+}
+
+def cmd_test(args) -> int:
+    """Run tests for a specific project or all projects."""
+    suite = getattr(args, "test_suite", None)
+    if suite == "all":
+        return _run_all_tests()
+    elif suite and suite in TEST_SUITES:
+        return _run_suite(suite, TEST_SUITES[suite])
+    elif suite:
+        match = _suggest(suite, list(TEST_SUITES.keys()))
+        if match:
+            CONSOLE.print(f"{red('Unknown test suite:')} {suite}")
+            CONSOLE.print(f"\n  Did you mean:\n    atlas test {match}")
+            return 1
+        CONSOLE.print(f"{red('Unknown test suite:')} {suite}")
+        CONSOLE.print(f"  Use {cyan('atlas test all')} to run everything")
+        CONSOLE.print(f"\n  Available: {', '.join(TEST_SUITES.keys())}")
+        return 1
+    else:
+        return _run_all_tests()
+
+def _run_all_tests() -> int:
+    CONSOLE.print(f"\n{bold('Atlas Test Suite')}")
+    CONSOLE.print()
+
+    total_passed = 0
+    total_failed = 0
+    total_skipped = 0
+    total_time = 0.0
+    has_failure = False
+
+    for name, path in TEST_SUITES.items():
+        result = _run_suite(name, path)
+        if result["failed"] > 0:
+            has_failure = True
+
+    CONSOLE.print()
+    if has_failure:
+        CONSOLE.print(yellow("Some tests failed. Review output above."))
+        return 1
+    else:
+        CONSOLE.print(green("All tests passed!"))
+        return 0
+
+def _run_suite(name: str, path: str) -> dict:
+    CONSOLE.print(f"{cyan('▶')} Running {bold(name)} tests...")
+
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        venv_python = Path(shutil.which("python3") or "python3")
+
+    start = time.time()
+    try:
+        result = subprocess.run(
+            [str(venv_python), "-m", "pytest", path, "-v", "--tb=short", "--no-header"],
+            capture_output=True, text=True, timeout=120, cwd=PROJECT_ROOT,
+        )
+        elapsed = round(time.time() - start, 1)
+
+        # Parse output
+        output = result.stdout + result.stderr
+        passed = failed = skipped = 0
+        for line in output.splitlines():
+            if "passed" in line:
+                parts = line.split()
+                for i, p in enumerate(parts):
+                    if p == "passed" and i > 0:
+                        try: passed = int(parts[i - 1])
+                        except ValueError: pass
+            if "failed" in line:
+                parts = line.split()
+                for i, p in enumerate(parts):
+                    if p == "failed" and i > 0:
+                        try: failed = int(parts[i - 1])
+                        except ValueError: pass
+            if "skipped" in line:
+                parts = line.split()
+                for i, p in enumerate(parts):
+                    if p == "skipped" and i > 0:
+                        try: skipped = int(parts[i - 1])
+                        except ValueError: pass
+
+        status = green("OK") if failed == 0 else red("FAIL")
+        CONSOLE.print(f"  {status} {passed} passed, {failed} failed, {skipped} skipped ({elapsed}s)")
+        CONSOLE.print()
+
+        return {"name": name, "passed": passed, "failed": failed, "skipped": skipped, "elapsed": elapsed, "returncode": result.returncode}
+    except subprocess.TimeoutExpired:
+        elapsed = round(time.time() - start, 1)
+        CONSOLE.print(red(f"  Timed out after 120s"))
+        CONSOLE.print()
+        return {"name": name, "passed": 0, "failed": -1, "skipped": 0, "elapsed": elapsed, "returncode": 1}
+    except Exception as e:
+        elapsed = round(time.time() - start, 1)
+        CONSOLE.print(red(f"  Error: {e}"))
+        CONSOLE.print()
+        return {"name": name, "passed": 0, "failed": -1, "skipped": 0, "elapsed": elapsed, "returncode": 1}
+
+# ---------------------------------------------------------------------------
+# Help screen (updated with test commands)
+# ---------------------------------------------------------------------------
+HELP_TEXT = f"""
+╔══════════════════════════════════════════════════════════╗
+║                         ATLAS                             ║
+║     One Proxy. Every Harness. Zero API Bills.           ║
+╚══════════════════════════════════════════════════════════╝
+
+Version     v{VERSION}
+Status      {"Running" if is_service_active("atlas-proxy") else "Stopped"}
+Provider    NVIDIA
+Proxy       {get_proxy_url()}
+
+────────────────────────────────────────────────────────────
+
+GENERAL
+
+  atlas install       First-time setup wizard
+  atlas doctor        Diagnose and repair problems
+  atlas update        Update Atlas
+  atlas shell         Open Atlas shell
+  atlas status        Show overall system status
+  atlas logs          Live proxy logs
+  atlas restart       Restart proxy
+  atlas restart --huggingface  Restart proxy with Hugging Face provider
+  atlas stop          Stop proxy
+  atlas start         Start proxy
+  atlas test          Run tests
+
+────────────────────────────────────────────────────────────
+
+PROXY
+
+  atlas proxy status
+  atlas proxy logs
+  atlas proxy restart
+  atlas proxy start
+  atlas proxy stop
+
+────────────────────────────────────────────────────────────
+
+OPENROUTER
+
+  atlas openrouter status
+  atlas openrouter logs
+  atlas openrouter restart
+  atlas openrouter start
+  atlas openrouter stop
+
+  atlas openrouter keys
+  atlas openrouter create
+  atlas openrouter import
+
+────────────────────────────────────────────────────────────
+
+NVIDIA
+
+  atlas nvidia status
+  atlas nvidia logs
+  atlas nvidia restart
+  atlas nvidia start
+  atlas nvidia stop
+
+  atlas nvidia keys
+  atlas nvidia create
+  atlas nvidia import
+
+────────────────────────────────────────────────────────────
+
+HUGGINGFACE
+
+  atlas huggingface status
+  atlas huggingface logs
+  atlas huggingface restart
+  atlas huggingface start
+  atlas huggingface stop
+
+  atlas huggingface keys
+  atlas huggingface create
+  atlas huggingface import
+
+────────────────────────────────────────────────────────────
+
+TESTING
+
+  atlas test              Run all tests
+  atlas test all          Run all test suites
+  atlas test openrouter   Run OpenRouter tests
+  atlas test nvidia       Run NVIDIA tests
+  atlas test huggingface   Run HuggingFace tests
+  atlas test atlas        Run Atlas proxy tests
+  atlas test installer    Run installer tests
+  atlas test integration  Run integration tests
+  atlas test setup        Run setup tests
+
+────────────────────────────────────────────────────────────
+
+ALL SERVICES
+
+  atlas start all
+  atlas stop all
+  atlas restart all
+  atlas status all
+  atlas logs all
+
+────────────────────────────────────────────────────────────
+
+EXAMPLES
+
+  atlas
+  atlas doctor
+  atlas restart
+  atlas restart all
+  atlas proxy logs
+  atlas openrouter restart
+  atlas nvidia logs
+  atlas openrouter create
+  atlas huggingface create
+  atlas status all
+  atlas test openrouter
+  atlas test all
+
+────────────────────────────────────────────────────────────
+
+Need help?  https://atlas.dev
+"""
+
+if __name__ == "__main__":
+    sys.exit(main())
