@@ -47,7 +47,22 @@ OPENROUTER_MESSAGES: str = f"{OPENROUTER_BASE_URL}/messages"
 OPENROUTER_MODELS: str = f"{OPENROUTER_BASE_URL}/models"
 OPENROUTER_RESPONSES: str = f"{OPENROUTER_BASE_URL}/responses"
 
-OPENROUTER_MODEL: str = _env("ATLAS_OPENROUTER_MODEL", _env("OPENROUTER_MODEL", "stealth/ox-alpha"))
+def _load_or_default_model() -> str:
+    """Runtime model override (from runtime_provider.json, written by the
+    installer's model picker or `atlas restart --model`) wins over env/env-default."""
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        p = _Path(__file__).resolve().parent.parent / "data" / "proxy_data" / "runtime_provider.json"
+        if p.is_file():
+            model = (_json.loads(p.read_text(encoding="utf-8")).get("model") or "").strip()
+            if model:
+                return model
+    except Exception as e:
+        log.warning("runtime model override unreadable: %s", e)
+    return _env("ATLAS_OPENROUTER_MODEL", _env("OPENROUTER_MODEL", "stealth/ox-alpha"))
+
+OPENROUTER_MODEL: str = _load_or_default_model()
 """Default model injected when the client omits "model" (or when FORCE_DEFAULT_MODEL)."""
 
 # ---------------------------------------------------------------------------
@@ -308,18 +323,16 @@ def _load_runtime_provider() -> str:
     return _env("ATLAS_PROVIDER", "openrouter")
 
 def _load_runtime_model() -> Optional[str]:
-    """Read model override from runtime config file (HF only)."""
+    """Read model override from runtime config file (any provider)."""
     try:
         import json as _json
         from pathlib import Path as _Path
         p = _Path(RUNTIME_PROVIDER_FILE)
         if p.is_file():
             data = _json.loads(p.read_text(encoding="utf-8"))
-            provider = data.get("provider", "").lower()
-            if provider in ("huggingface", "hf"):
-                model = data.get("model", "").strip()
-                if model:
-                    return model
+            model = data.get("model", "").strip()
+            if model:
+                return model
     except Exception:
         pass
     return None

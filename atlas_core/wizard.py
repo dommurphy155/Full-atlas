@@ -10,6 +10,7 @@ Run via install.sh. Flow:
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import time
@@ -358,7 +359,6 @@ def configure_hermes() -> str | None:
         ).returncode == 0
 
     ok = all([
-        hset("model.default", "atlas-auto"),
         hset("model.provider", "custom"),
         hset("model.base_url", "http://127.0.0.1:8788/v1"),
         hset("model.api_key", "local-dummy"),
@@ -409,6 +409,100 @@ def bootstrap_openrouter_key() -> None:
         except OSError:
             pass
     console.print("[green]✔ Key added — the proxy hot-reloads it within 5 seconds[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Model picker (after key bootstrap): newest :free models from OpenRouter
+# ---------------------------------------------------------------------------
+
+def fetch_free_models(limit: int = 40) -> list[dict]:
+    """Newest OpenRouter :free models, sorted by release date (newest first)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"User-Agent": "atlas-installer/2.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        models = [m for m in data.get("data", []) if m.get("id", "").endswith(":free")]
+        models.sort(key=lambda m: m.get("created", 0), reverse=True)
+        return models[:limit]
+    except Exception as e:
+        console.print(f"[yellow]⚠ Couldn't fetch model list ({e})[/yellow]")
+        return []
+
+
+def pick_default_model() -> None:
+    """Let the user choose the proxy's default model. Writes
+    data/proxy_data/runtime_provider.json — the same file `atlas restart`
+    uses; the proxy reads it at startup. No model is ever forced onto
+    requests that name their own model unless FORCE_DEFAULT_MODEL is set."""
+    if not _interactive():
+        console.print("[dim]Non-interactive: keeping proxy default model[/dim]")
+        return
+    models = fetch_free_models()
+    if not models:
+        console.print("[dim]Skipping model selection — proxy default stays active[/dim]")
+        return
+
+    console.print()
+    console.print(Panel.fit(
+        "[bold]Pick your default model[/bold]\n\n"
+        "Newest free models on OpenRouter. This is what the proxy serves\n"
+        "when a harness doesn't specify one — you can change it anytime:\n"
+        "  atlas restart --model <id>",
+        border_style="cyan", width=68,
+    ))
+    PAGE = 10
+    offset = 0
+    while True:
+        page = models[offset:offset + PAGE]
+        for i, m in enumerate(page):
+            age_days = max(0, (time.time() - m.get("created", 0)) // 86400)
+            ctx = m.get("context_length") or 0
+            ctx_s = f"{ctx // 1000}k" if ctx >= 1000 else str(ctx)
+            console.print(
+                f"  [cyan]{offset + i + 1:>2}[/cyan] {m['id']}"
+                f" [dim]{ctx_s} ctx, {age_days}d old[/dim]"
+            )
+        nav = []
+        if offset + PAGE < len(models):
+            nav.append("n=next")
+        if offset > 0:
+            nav.append("b=back")
+        nav.append("s=skip")
+        suffix = f" [{', '.join(nav)}]" if nav else ""
+        choice = ask(f"Model number{suffix}", default="").strip().lower()
+        if choice == "n" and offset + PAGE < len(models):
+            offset += PAGE
+            continue
+        if choice == "b" and offset > 0:
+            offset -= PAGE
+            continue
+        if choice == "s":
+            console.print("[dim]Keeping proxy default model[/dim]")
+            return
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            picked = models[int(choice) - 1]
+            break
+        console.print("[yellow]Invalid choice[/yellow]")
+
+    model_id = picked["id"]
+    rp_dir = DATA_DIR / "proxy_data"
+    rp_dir.mkdir(parents=True, exist_ok=True)
+    rp_file = rp_dir / "runtime_provider.json"
+    try:
+        existing = json.loads(rp_file.read_text()) if rp_file.exists() else {}
+    except Exception:
+        existing = {}
+    existing.update({
+        "provider": existing.get("provider", "openrouter"),
+        "model": model_id,
+        "timestamp": int(time.time()),
+    })
+    rp_file.write_text(json.dumps(existing, indent=2))
+    console.print(f"[green]✔ Default model set to {model_id}[/green] [dim](proxy picks it up on next restart)[/dim]")
 
 
 def mention_email_keys() -> None:
@@ -523,11 +617,32 @@ def main() -> None:
             launch_cmd = fn()
 
     bootstrap_openrouter_key()
+    pick_default_model()
 
     # First hard gate: services need real deps on disk.
     wait_deps(pip_pid)
     ensure_playwright_chromium()
     start_services()
+    # If the user picked a model, bounce the proxy so it's live immediately.
+    rp_file = DATA_DIR / "proxy_data" / "runtime_provider.json"
+    try:
+        chosen_model = json.loads(rp_file.read_text()).get("model", "")
+    except Exception:
+        chosen_model = ""
+    if chosen_model and get_backend().is_running("proxy"):
+        backend = get_backend()
+        backend.restart("proxy")
+        import urllib.request
+        deadline = time.time() + 15
+        with console.status("[cyan]Applying model choice..."):
+            while time.time() < deadline:
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:8788/health", timeout=2) as resp:
+                        if resp.status == 200:
+                            break
+                except Exception:
+                    time.sleep(0.5)
+        console.print(f"[green]✔ Model live: {chosen_model}[/green]")
     maybe_start_bots()
     mention_email_keys()
 
