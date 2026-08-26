@@ -25,6 +25,82 @@ from .service import get_backend, SERVICE_SPECS
 from .display import find_chrome
 
 console = Console()
+
+# ---------------------------------------------------------------------------
+# Non-TTY resilience: under `curl | bash` (or CI), Python's stdin is the pipe
+# and every input() would EOF-crash. Prefer the controlling terminal (/dev/tty);
+# fall back to env overrides / safe defaults when no terminal exists at all.
+# ---------------------------------------------------------------------------
+try:
+    _tty_fd = os.open("/dev/tty", os.O_RDONLY)
+except OSError:
+    _tty_fd = None
+
+
+def _interactive() -> bool:
+    return _tty_fd is not None
+
+
+def _tty_read(prompt_text: str, hide: bool = False) -> str:
+    """Read one line from the controlling terminal. Raises EOFError.
+
+    Prompts go to stdout; input comes from a single raw /dev/tty fd so
+    piped input can't be split between competing file descriptions.
+    """
+    assert _tty_fd is not None
+    console.print(prompt_text, end="")
+    if hide:
+        import getpass
+        return getpass.getpass("")  # opens /dev/tty itself, no echo
+    buf = b""
+    while not buf.endswith(b"\n"):
+        ch = os.read(_tty_fd, 1)
+        if not ch:
+            raise EOFError
+        buf += ch
+    return buf.decode(errors="replace").strip()
+
+
+def ask(prompt: str, *, password: bool = False, default: str = "") -> str:
+    """Input that survives non-TTY runs: env override -> tty -> default."""
+    env_key = "ATLAS_ANSWER_" + "".join(
+        c for c in prompt.upper() if c.isalnum()
+    )[:24]
+    if os.environ.get(env_key):
+        return os.environ[env_key]
+    suffix = f" [default: {default}]" if default else ""
+    if _interactive():
+        try:
+            val = _tty_read(f"{prompt}{suffix}: ", hide=password)
+            return val or default
+        except (EOFError, OSError):
+            pass
+    console.print(f"{prompt} [dim](non-interactive: using default '{default or '<empty>'}')[/dim]")
+    return default
+
+
+def confirm(prompt: str, *, default: bool = True) -> bool:
+    if _interactive():
+        hint = "Y/n" if default else "y/N"
+        try:
+            while True:
+                val = _tty_read(f"{prompt} [{hint}]: ").lower()
+                if not val:
+                    return default
+                if val in ("y", "yes"):
+                    return True
+                if val in ("n", "no"):
+                    return False
+        except (EOFError, OSError):
+            pass
+    else:
+        val = os.environ.get("ATLAS_ANSWER_START_BOTS")
+        if val is not None:
+            return val.strip().lower() in ("1", "y", "yes", "true", "on")
+    console.print(f"{prompt} [dim](non-interactive: {default})[/dim]")
+    return default
+
+
 BANNER = r"""
  █████╗ ████████╗██╗      █████╗ ███████╗
 ██╔══██╗╚══██╔══╝██║     ██╔══██╗██╔════╝
@@ -317,7 +393,7 @@ def bootstrap_openrouter_key() -> None:
         "goes wrong you can ask an agent to help fix it.",
         border_style="cyan", width=64,
     ))
-    key = Prompt.ask("OpenRouter key (sk-or-...) or Enter to skip", password=True, default="")
+    key = ask("OpenRouter key (sk-or-...) or Enter to skip", password=True, default="")
     key = key.strip()
     if not key:
         console.print("[yellow]Skipped — bots-only mode. You can add one later: atlas openrouter import[/yellow]")
@@ -382,7 +458,7 @@ def start_services() -> None:
 
 
 def maybe_start_bots() -> None:
-    if Confirm.ask("Start the key-farming automations now?", default=True):
+    if confirm("Start the key-farming automations now?", default=True):
         backend = get_backend()
         for name in ("openrouter", "nvidia", "huggingface"):
             if not backend.is_running(name):
@@ -434,7 +510,10 @@ def main() -> None:
     for i, (k, (label, _)) in enumerate(opts, 1):
         console.print(f"  [cyan]{i}[/cyan] {label}")
     console.print("  [cyan]4[/cyan] Set up others later")
-    choice = Prompt.ask("Select", choices=["1", "2", "3", "4"], default="1")
+    choice = ask("Select", default="1").strip()
+    if choice not in ("1", "2", "3", "4"):
+        console.print(f"[yellow]Invalid choice '{choice}' — using default (1)[/yellow]")
+        choice = "1"
 
     launch_cmd = None
     if choice != "4":
