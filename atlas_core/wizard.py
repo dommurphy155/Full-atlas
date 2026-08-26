@@ -412,8 +412,155 @@ def bootstrap_openrouter_key() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Model picker (after key bootstrap): newest :free models from OpenRouter
+# Key discovery — find keys already on the machine so we never ask twice
 # ---------------------------------------------------------------------------
+
+_ENV_KEY_MAP = {
+    "OPENROUTER_API_KEY": "openrouter",
+    "NVIDIA_API_KEY": "nvidia",
+    "NVAPI_KEY": "nvidia",
+    "HF_TOKEN": "huggingface",
+    "HUGGINGFACE_API_KEY": "huggingface",
+    "HF_API_KEY": "huggingface",
+    "AGENTMAIL_API_KEY": "agentmail",
+}
+
+_KEY_PREFIXES = {
+    "sk-or-": "openrouter",
+    "nvapi-": "nvidia",
+    "hf_": "huggingface",
+}
+
+_PROFILE_FILES = (".bashrc", ".zshrc", ".profile", ".bash_profile")
+
+
+def _key_file_for(provider: str) -> Path:
+    return {
+        "openrouter": DATA_DIR / "openrouter_data" / "openroute_keys.txt",
+        "nvidia": DATA_DIR / "nvidia_data" / "nvda_keys.txt",
+        "huggingface": DATA_DIR / "huggingface_data" / "hf_keys.txt",
+    }[provider]
+
+
+def _pool_has_keys(provider: str) -> bool:
+    kf = _key_file_for(provider)
+    return kf.exists() and bool(kf.read_text().strip())
+
+
+def discover_existing_keys() -> dict[str, list[str]]:
+    """Find provider API keys already on this machine.
+
+    Sources: environment vars, well-known credential files, shell profiles.
+    Returns {provider: [keys]} (validated by prefix, deduplicated).
+    """
+    import re
+    found: dict[str, list[str]] = {}
+
+    def _add(provider: str, key: str, ) -> None:
+        key = key.strip().strip("'\"")
+        # shape check: prefix + enough secret after it
+        if len(key) < 20:
+            return
+        lst = found.setdefault(provider, [])
+        if key not in lst:
+            lst.append(key)
+
+    # 1. Environment variables
+    for var, provider in _ENV_KEY_MAP.items():
+        val = os.environ.get(var, "").strip()
+        if val:
+            _add(provider, val)
+
+    # 2. Well-known credential files
+    for cand, provider in (
+        (Path.home() / ".cache" / "huggingface" / "token", "huggingface"),
+        (Path.home() / ".huggingface" / "token", "huggingface"),
+        (Path.home() / ".openrouter" / "api_key", "openrouter"),
+    ):
+        try:
+            if cand.is_file():
+                txt = cand.read_text(errors="replace").strip()
+                # files may hold "export VAR=..." style lines too
+                m = re.search(r"(sk-or-[A-Za-z0-9_-]+|nvapi-[A-Za-z0-9_-]+|hf_[A-Za-z0-9]+)", txt)
+                if m:
+                    _add(provider, m.group(0))
+        except OSError:
+            pass
+
+    # 3. Shell profiles (exports / one-liners)
+    for prof in _PROFILE_FILES:
+        p = Path.home() / prof
+        try:
+            if not p.is_file():
+                continue
+            txt = p.read_text(errors="replace")
+            for prefix, provider in _KEY_PREFIXES.items():
+                for m in re.finditer(re.escape(prefix) + r"[A-Za-z0-9_-]{16,}", txt):
+                    _add(provider, m.group(0))
+            am = re.search(r"AGENTMAIL_API_KEY=[\"']?([A-Za-z0-9_-]{10,})", txt)
+            if am:
+                _add("agentmail", am.group(1))
+        except OSError:
+            pass
+
+    # 4. Project .env
+    try:
+        envf = PROJECT_ROOT / ".env"
+        if envf.is_file():
+            txt = envf.read_text(errors="replace")
+            am = re.search(r"AGENTMAIL_API_KEY=[\"']?([A-Za-z0-9_-]{10,})", txt)
+            if am:
+                _add("agentmail", am.group(1))
+    except OSError:
+        pass
+
+    return found
+
+
+def import_discovered_keys(found: dict[str, list[str]]) -> dict[str, int]:
+    """Write discovered keys into Atlas's key files / .env. Returns counts."""
+    counts: dict[str, int] = {}
+    for provider in ("openrouter", "nvidia", "huggingface"):
+        keys = found.get(provider) or []
+        added = 0
+        for key in keys:
+            kf = _key_file_for(provider)
+            kf.parent.mkdir(parents=True, exist_ok=True)
+            existing = set(kf.read_text().split()) if kf.exists() else set()
+            if key not in existing:
+                with open(kf, "a") as f:
+                    f.write(key + "\n")
+                try:
+                    os.chmod(kf, 0o600)
+                except OSError:
+                    pass
+                added += 1
+        if added:
+            counts[provider] = counts.get(provider, 0) + added
+
+    am_keys = found.get("agentmail") or []
+    if am_keys:
+        envf = PROJECT_ROOT / ".env"
+        txt = envf.read_text() if envf.exists() else ""
+        if "AGENTMAIL_API_KEY=" not in txt:
+            with open(envf, "a") as f:
+                f.write(f"AGENTMAIL_API_KEY={am_keys[0]}\n")
+            counts["agentmail"] = 1
+    return counts
+
+
+def report_and_import_existing() -> dict[str, list[str]]:
+    """Discover + import machine-local keys; prints what happened."""
+    found = discover_existing_keys()
+    if not found:
+        return {}
+    counts = import_discovered_keys(found)
+    parts = []
+    for prov, n in sorted(counts.items()):
+        label = {"agentmail": "AgentMail"}.get(prov, prov.title())
+        parts.append(f"{n} {label}")
+    console.print("[green]✔ Found existing API keys on this machine — imported:[/green] " + ", ".join(parts))
+    return found
 
 def fetch_free_models(limit: int = 40) -> list[dict]:
     """Newest OpenRouter :free models, sorted by release date (newest first)."""
@@ -616,8 +763,16 @@ def main() -> None:
         with console.status(f"[cyan]Configuring {label}..."):
             launch_cmd = fn()
 
-    bootstrap_openrouter_key()
-    pick_default_model()
+    # Scan for keys already on this machine — never re-ask for what exists.
+    existing = report_and_import_existing()
+    have_openrouter = bool(existing.get("openrouter")) or _pool_has_keys("openrouter")
+    if have_openrouter:
+        console.print("[green]✔ OpenRouter key(s) already available — no need to paste one[/green]")
+        pick_default_model()
+    else:
+        bootstrap_openrouter_key()
+        if _pool_has_keys("openrouter"):
+            pick_default_model()
 
     # First hard gate: services need real deps on disk.
     wait_deps(pip_pid)
