@@ -21,7 +21,7 @@ from .config import (
     MAX_KEEPALIVE_CONNECTIONS,
     MAX_RETRIES,
     MAX_RESPONSE_BYTES,
-    OPENROUTER_MODELS,
+    get_models_url,
     POOL_TIMEOUT,
     PREWARM_INTERVAL,
     PROXY_KEEPALIVE_SECONDS,
@@ -30,8 +30,6 @@ from .config import (
     UPSTREAM_REFERER,
     UPSTREAM_TITLE,
     WRITE_TIMEOUT,
-    PROVIDER,
-    HF_BASE_URL,
     get_default_model,
     is_hf_rate_limit_error,
     is_hf_key_invalid,
@@ -233,6 +231,21 @@ def _is_content_sse_frame(frame: bytes) -> bool:
     return False
 
 
+# Maps mid-stream SSE error kinds (from ``_classify_sse_frame``) to HTTP
+# status codes used for key-pool health bookkeeping (``mark_error``).
+# Hoisted to module level — was previously redefined inline on every
+# mid-stream error frame in both ``event_generator`` and
+# ``frame_generator``.
+_KIND_TO_STATUS: dict[str, int] = {
+    "rate_limit": 429,
+    "concurrency": 429,
+    "idle_timeout": 408,
+    "overloaded": 503,
+    "context_length": 400,
+    "generic_error": 502,
+}
+
+
 class ProxyCore:
     def __init__(self, pool: KeyPool, provider: str = "openrouter") -> None:
         self.pool = pool
@@ -286,10 +299,10 @@ class ProxyCore:
         if self.pool.total == 0:
             log.warning("Skipping TLS prewarm - no keys available yet")
             return
-        
+
         assert self.client is not None
         key, _, _ = self.pool.next_key()
-        models_url = OPENROUTER_MODELS if self.provider != "huggingface" else f"{HF_BASE_URL}/models"
+        models_url = get_models_url()
         try:
             resp = await self.client.get(
                 models_url,
@@ -700,7 +713,7 @@ class ProxyCore:
               • track whether any bytes were yielded
               • always release the key's in-flight slot + free-model semaphore
             """
-            
+
             buf = b""
             saw_message_stop = False
             stream_error = False
@@ -761,15 +774,7 @@ class ProxyCore:
                             # Never collapse everything to 429: context-length
                             # errors are not rate limits, and overload/idle
                             # are distinct upstream conditions.
-                            kind_to_status = {
-                                "rate_limit": 429,
-                                "concurrency": 429,
-                                "idle_timeout": 408,
-                                "overloaded": 503,
-                                "context_length": 400,
-                                "generic_error": 502,
-                            }
-                            err_status = kind_to_status.get(frame_error["kind"], 502)
+                            err_status = _KIND_TO_STATUS.get(frame_error["kind"], 502)
                             try:
                                 await self.pool.mark_error(key_idx, err_status)
                             except Exception:
@@ -986,7 +991,7 @@ class ProxyCore:
             """
             Yield raw SSE frames with keepalive and error detection.
             """
-            
+
             buf = b""
             stream_error = False
             stream_error_reason = ""  # diagnostic: who caused the stream to fail
@@ -1039,15 +1044,7 @@ class ProxyCore:
                                 frame[:300],
                             )
                             # Map the structured error kind to a status
-                            kind_to_status = {
-                                "rate_limit": 429,
-                                "concurrency": 429,
-                                "idle_timeout": 408,
-                                "overloaded": 503,
-                                "context_length": 400,
-                                "generic_error": 502,
-                            }
-                            err_status = kind_to_status.get(frame_error["kind"], 502)
+                            err_status = _KIND_TO_STATUS.get(frame_error["kind"], 502)
                             try:
                                 await self.pool.mark_error(key_idx, err_status)
                             except Exception:

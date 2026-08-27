@@ -520,7 +520,6 @@ def anthropic_messages_to_openai(
             image_parts: List[Dict] = []
             other_parts: List[Any] = []
             user_cache_controls: List[Dict[str, Any]] = []
-            tr_cache_controls: List[Dict[str, Any]] = []
             for block in content:
                 if not isinstance(block, dict):
                     if block is not None:
@@ -1122,7 +1121,6 @@ def _trim_message_content(msg: Dict[str, Any], max_tokens: int) -> Dict[str, Any
                 continue
             bt = block.get("type")
             if bt == "text":
-                tlen = len(block.get("text", ""))
                 ttokens = _estimate_tokens(block.get("text", ""))
                 if ttokens > remaining:
                     allowed_chars = int(remaining * _CHAR_PER_TOKEN * 0.9)

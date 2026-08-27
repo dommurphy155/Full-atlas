@@ -261,7 +261,6 @@ class KeyPool:
         # If none healthy, fall back to the plain round-robin next key.
         best_i: int | None = None
         best_inflight = 10**9
-        healthy_found = False
         capacity_found = False
 
         for _ in range(self._n):
@@ -270,7 +269,6 @@ class KeyPool:
             info = self._keys[i]
 
             if info.state == KeyState.HEALTHY:
-                healthy_found = True
                 if info.in_flight < MAX_CONCURRENT_PER_KEY:
                     # Has capacity — prefer this over at-capacity keys
                     capacity_found = True

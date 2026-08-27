@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 import time
-import re
 import uuid
 
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -1023,7 +1022,6 @@ async def responses(request: Request) -> Response:
         assert proxy.client is not None
         key, key_idx, is_healthy = proxy.pool.next_key()
         headers = proxy._headers(key)
-        t0 = time.perf_counter()
 
         def _evt(event: str, data: dict) -> bytes:
             raw = dumps(data)
@@ -1052,8 +1050,6 @@ async def responses(request: Request) -> Response:
 
         item_id = f"{rid}-msg"
         content_index = 0
-        fc_item_id = f"{rid}-fc"
-        fc_index = 0
 
         # 1. response.created
         yield _evt("response.created", {
