@@ -788,21 +788,14 @@ class ProxyCore:
                                     retire_and_remove_hf_key(key_str)
                                 await self.pool.retire_key(key_idx)
 
-                            if is_messages:
-                                err_msg = frame_error.get("message") or (
-                                    "Upstream provider error "
-                                    f"({frame_error['kind']})"
-                                )
-                                err = (
-                                    b'event: error\n'
-                                    b'data: {"type":"error","error":{"type":"api_error",'
-                                    b'"message":' + dumps(err_msg) + b'}}\n\n'
-                                )
-                                yield err
-                                yielded_any = True
-                            else:
-                                yield frame + b"\n\n"
-                                yielded_any = True
+                            # Do NOT yield the raw error frame to the client — it
+                            # confuses Anthropic/OpenAI SDKs (they parse it as a
+                            # valid chunk and then mismatch final usage). Just mark
+                            # the key unhealthy and return; the finally block
+                            # synthesizes message_stop for is_messages streams so
+                            # the Anthropic client doesn't hang in "Thought for…".
+                            # The next request will rotate off this key via
+                            # next_key()'s cooldown skip.
                             return
 
                         if is_messages and b"message_stop" in frame:
@@ -849,15 +842,23 @@ class ProxyCore:
                 except Exception:
                     pass
             finally:
+                # For is_messages (Anthropic-format) streams, always terminate
+                # with a clean message_stop if we haven't already. This applies
+                # to both the "incomplete upstream" case (saw_content but no
+                # message_stop) AND mid-stream error cases (stream_error=True)
+                # so the Anthropic SDK doesn't hang in "Thought for…" waiting
+                # for a stop frame after a provider_error (e.g. 402 Insufficient
+                # balance) cuts the stream short.
                 if (
                     is_messages
-                    and not saw_message_stop
-                    and not stream_error
                     and saw_content
+                    and not saw_message_stop
                 ):
                     log.warning(
-                        "req=%s synthesizing message_stop after incomplete upstream",
+                        "req=%s synthesizing message_stop after incomplete upstream (stream_error=%s reason=%s)",
                         request_id,
+                        stream_error,
+                        stream_error_reason,
                     )
                     tail = (
                         b'event: message_delta\n'
@@ -872,7 +873,7 @@ class ProxyCore:
                         pass
                 elif is_messages and not saw_message_stop and stream_error:
                     log.warning(
-                        "req=%s skipping message_stop synthesis (stream_error=True yielded=%s) reason=%s",
+                        "req=%s skipping message_stop synthesis (stream_error=True yielded=%s reason=%s)",
                         request_id,
                         yielded_any,
                         stream_error_reason,
@@ -1058,7 +1059,11 @@ class ProxyCore:
                                     retire_and_remove_hf_key(key_str)
                                 await self.pool.retire_key(key_idx)
 
-                            yield frame + b"\n\n"
+                            # Do NOT yield the error frame — terminate the stream
+                            # cleanly so the next request rotates off this key via
+                            # next_key()'s cooldown skip. Clients see a clean SSE
+                            # EOF (Anthropic clients will need a message_stop —
+                            # the finally block handles that).
                             return
 
                         yield frame + b"\n\n"

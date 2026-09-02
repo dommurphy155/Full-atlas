@@ -152,13 +152,19 @@ sleep 1
 # X display setup                                                     #
 # --------------------------------------------------------------------------- #
 
-DISPLAY_NUM=1
-DISPLAY=":${DISPLAY_NUM}"
+# Auto-detect an available X display.  The hardcoded :1 socket is often stale
+# on this machine (no Xvfb actually running on it), so scan :99, :2, :100 …
+_detected_display=""
+for _d in :99 :2 :100 :1 ; do
+    if xdpyinfo -display "${_d}" >/dev/null 2>&1; then
+        _detected_display="${_d}"
+        break
+    fi
+done
 
-if xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
-    log "Using existing X display ${DISPLAY}"
-else
-    log "Starting Xvfb on ${DISPLAY}"
+if [ -z "${_detected_display}" ]; then
+    # No existing X display — start a fresh Xvfb on :99
+    DISPLAY=":99"
     Xvfb "${DISPLAY}" -screen 0 1920x1080x24 -ac +extension GLX +render -noreset >/dev/null 2>&1 &
     XVFB_PID=$!
     sleep 2
@@ -166,6 +172,10 @@ else
         log "ERROR: Xvfb failed to start"
         exit 1
     fi
+    log "Started new Xvfb on ${DISPLAY}"
+else
+    DISPLAY="${_detected_display}"
+    log "Using existing X display ${DISPLAY}"
 fi
 export DISPLAY
 

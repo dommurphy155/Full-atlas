@@ -33,7 +33,7 @@ import threading
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterable, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Configuration (read once at import)

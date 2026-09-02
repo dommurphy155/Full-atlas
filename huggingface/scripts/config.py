@@ -457,12 +457,16 @@ def _ensure_profiles_interactive() -> None:
         print()
         _prompt("  [SETUP] Press Enter to launch the profile creator...")
 
+        # Resolve from this config file's actual location so the project
+        # works regardless of where the repository is installed.
+        profile_creator = Path(__file__).resolve().parent / "add_captcha_account.py"
+
         result = subprocess.run(
-            [sys.executable, str(ROOT_DIR / "scripts" / "add_captcha_account.py")]
+            [sys.executable, str(profile_creator)]
         )
         if result.returncode != 0:
             print("\n  [SETUP] Profile creation failed. Please retry manually:")
-            print(f"  [SETUP]   python3 {ROOT_DIR / 'scripts' / 'add_captcha_account.py'}")
+            print(f"  [SETUP]   python3 {profile_creator}")
             sys.exit(1)
 
         print("  [SETUP] Profile created successfully.")

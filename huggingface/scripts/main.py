@@ -225,32 +225,116 @@ def load_captcha_cookie() -> Optional[list]:
 
 
 async def inject_cookie(page, cookie: dict):
-    """Inject a cookie after first navigating to the cookie's domain so
-    Chromium's SameSite/domain rules accept it. For hCaptcha cookies we
-    must be on https://www.hcaptcha.com first."""
+    """Navigate to the cookie domain, inject exactly one supplied cookie,
+    and verify that it landed in the browser cookie jar."""
+    name = cookie.get("name")
+    domain = cookie.get("domain")
+    path = cookie.get("path", "/")
+
+    if not name or not domain:
+        raise ValueError(
+            f"Invalid cookie: name={name!r}, domain={domain!r}"
+        )
+
     cookie_dict = {
-        "name": cookie.get("name"),
-        "value": cookie.get("value"),
-        "domain": cookie.get("domain", ".huggingface.co"),
-        "path": cookie.get("path", "/"),
+        "name": name,
+        "value": cookie.get("value", ""),
+        "domain": domain,
+        "path": path,
         "httpOnly": cookie.get("httpOnly", False),
         "secure": cookie.get("secure", True),
         "sameSite": cookie.get("sameSite", "Lax"),
     }
+
     expiry = cookie.get("expires")
     if expiry and expiry > 0:
         cookie_dict["expires"] = expiry
 
-    # Navigate to the cookie's domain so the browser accepts it
-    cookie_domain = cookie.get("domain", "")
-    if cookie_domain:
-        url = "https://" + cookie_domain.lstrip(".")
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-        except Exception:
-            pass  # Best-effort — some domains time out on load; injection can still work
+    cookie_host = domain.lstrip(".")
+    target_url = f"https://{cookie_host}/"
 
+    log(
+        f"Cookie target: name={name!r} "
+        f"domain={domain!r} path={path!r}"
+    )
+
+    # Navigate to the supplied cookie's domain first.
+    try:
+        await page.goto(
+            target_url,
+            wait_until="domcontentloaded",
+            timeout=15000,
+        )
+    except Exception as exc:
+        log(f"Cookie-domain navigation warning: {exc}")
+
+    # Inject ONLY the cookie supplied by the caller.
+    log(
+        f"Injecting cookie: name={name!r} "
+        f"domain={domain!r} path={path!r}"
+    )
     await page.context.add_cookies([cookie_dict])
+
+    # Immediately inspect the browser cookie jar.
+    browser_cookies = await page.context.cookies()
+
+    # DEBUG: dump all cookies to see what Playwright actually returns
+    log(f"DEBUG: {len(browser_cookies)} cookies in jar after add_cookies:")
+    for c in browser_cookies:
+        log(f"  DEBUG cookie: name={c.get('name')!r} domain={c.get('domain')!r} path={c.get('path')!r} expires={c.get('expires')!r}")
+
+    # Playwright normalizes cookie domains: a leading dot (.hcaptcha.com)
+    # is stored/returned as the bare domain (hcaptcha.com). Normalize both
+    # sides so the match succeeds regardless of how the cookie was supplied.
+    matches = [
+        c for c in browser_cookies
+        if c.get("name") == name
+        and c.get("domain", "").lstrip(".") == domain.lstrip(".")
+        and c.get("path", "/") == path
+    ]
+
+    if not matches:
+        # Fallback: try matching with raw domain (in case normalization differs)
+        matches_raw = [
+            c for c in browser_cookies
+            if c.get("name") == name and c.get("domain", "") == domain
+        ]
+        log(f"DEBUG: normalized match failed, raw match count={len(matches_raw)}")
+        if matches_raw:
+            log(f"DEBUG: raw match domain={matches_raw[0].get('domain')!r}")
+            matches = matches_raw
+
+    if not matches:
+        log(
+            f"COOKIE VERIFICATION FAILED: "
+            f"name={name!r} domain={domain!r} path={path!r}"
+        )
+
+        log("Browser cookies currently present:")
+        for c in browser_cookies:
+            log(
+                f"  name={c.get('name')!r} "
+                f"domain={c.get('domain')!r} "
+                f"path={c.get('path', '/')!r}"
+            )
+
+        raise RuntimeError(
+            f"Cookie did not appear in browser jar: "
+            f"{name!r} {domain!r} {path!r}"
+        )
+
+    landed = matches[0]
+
+    log(
+        f"COOKIE VERIFIED: "
+        f"name={landed.get('name')!r} "
+        f"domain={landed.get('domain')!r} "
+        f"path={landed.get('path', '/')!r}"
+    )
+
+    return landed
+
+
 
 
 def run_get_cookie() -> bool:
@@ -286,111 +370,25 @@ def run_get_cookie() -> bool:
         return False
 
 
-def _validate_email(email: str) -> None:
-    if not email:
-        raise ValueError("Email is required")
-    # Relaxed check: just needs @ and a dot in the domain part
-    at_idx = email.find('@')
-    if at_idx == -1 or at_idx == 0 or at_idx == len(email) - 1:
-        raise ValueError("Invalid email format")
-    domain = email[at_idx + 1:]
-    if '.' not in domain:
-        raise ValueError("Invalid email format")
-
-
-def create_agentmail_email() -> Optional[str]:
-    subprocess.run([sys.executable, str(AGENTMAIL_SCRIPT), "burn"], capture_output=True)
-
-    result = subprocess.run(
-        [sys.executable, str(AGENTMAIL_SCRIPT), "create"],
-        capture_output=True, text=True, timeout=120,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-    )
-    if result.returncode != 0:
-        return None
-    # stdout may contain log lines from agentmail logger — take last line
-    email = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
-    if not email:
-        return None
-    _validate_email(email)
-    return email
-
-
-def _poll_agentmail(timeout: int) -> Optional[str]:
-    """Generic polling loop for verification URL."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            result = subprocess.run(
-                [sys.executable, str(AGENTMAIL_SCRIPT), "check"],
-                capture_output=True, text=True, timeout=30,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                url = result.stdout.strip().splitlines()[-1]
-                if HF_CONFIRMATION_URL_PREFIX in url or "huggingface.co/email_confirmation" in url:
-                    return url
-        except Exception:
-            pass
-        time.sleep(EMAIL_POLL_INTERVAL)
-    return None
-
-
-def poll_verification_email(timeout: int = 7) -> Optional[str]:
-    """Poll for verification email for exactly `timeout` seconds."""
-    return _poll_agentmail(timeout)
-
-
-def poll_verification_email_long(timeout: int = EMAIL_POLL_TIMEOUT) -> Optional[str]:
-    return _poll_agentmail(timeout)
-
-
-async def _verify_cookies_injected(page, expected_cookies: list):
-    """Verify expected cookies actually exist in the connected browser context.
-    Silent on success — only logs diagnostic info when verification fails."""
-    if not expected_cookies:
-        return True
-
-    context = page.context
-
-    # Read the complete browser context + hCaptcha origins for domain-scoped cookies.
-    all_cookies = []
-    try:
-        all_cookies.extend(await context.cookies())
-    except Exception:
-        pass
-    for url in ("https://hcaptcha.com/", "https://www.hcaptcha.com/"):
-        try:
-            all_cookies.extend(await context.cookies([url]))
-        except Exception:
-            pass
-
-    # Deduplicate by name/domain/path
-    seen = {}
-    for c in all_cookies:
-        key = (c.get("name"), c.get("domain"), c.get("path", "/"))
-        seen[key] = c
-    actual_cookies = list(seen.values())
-
-    for expected in expected_cookies:
-        name = expected.get("name")
-        expected_domain = expected.get("domain")
-        expected_path = expected.get("path", "/")
-
-        match = next(
-            (c for c in actual_cookies
-             if c.get("name") == name
-             and c.get("domain") == expected_domain
-             and c.get("path", "/") == expected_path),
-            None
+async def _verify_cookies_injected(page, cookies: list) -> bool:
+    """Verify all supplied cookies are present in the browser jar
+    with correct name + domain + path. Domain must match after
+    stripping a leading dot (browser normalizes '.hcaptcha.com' → 'hcaptcha.com').
+    """
+    browser_cookies = await page.context.cookies()
+    for cookie in cookies:
+        name = cookie.get("name")
+        domain = cookie.get("domain", "").lstrip(".")
+        path = cookie.get("path", "/")
+        found = any(
+            c.get("name") == name
+            and c.get("domain", "").lstrip(".") == domain
+            and c.get("path", "/") == path
+            for c in browser_cookies
         )
-        if not match:
-            log(f"Cookie verification FAILED — {name!r} not found for domain={expected_domain!r}")
-            # Diagnostic inventory on failure
-            for c in actual_cookies:
-                log(f"  browser cookie: name={c.get('name')!r} domain={c.get('domain')!r} path={c.get('path')!r}")
+        if not found:
+            log(f"Cookie verification failed: {name} @ {domain}{path}")
             return False
-
     return True
 
 
@@ -453,6 +451,91 @@ async def launch_cdp_and_fill_cookie(profile_suffix: str = "") -> tuple:
         log("No valid captcha cookie found")
 
     return pw, browser, context, page, port, cdp_proc
+
+
+def _validate_email(email: str) -> None:
+    if not email:
+        raise ValueError("Email is required")
+
+    at_idx = email.find("@")
+    if at_idx == -1 or at_idx == 0 or at_idx == len(email) - 1:
+        raise ValueError("Invalid email format")
+
+    domain = email[at_idx + 1:]
+    if "." not in domain:
+        raise ValueError("Invalid email format")
+
+
+def create_agentmail_email() -> Optional[str]:
+    subprocess.run(
+        [sys.executable, str(AGENTMAIL_SCRIPT), "burn"],
+        capture_output=True,
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(AGENTMAIL_SCRIPT), "create"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+
+    if result.returncode != 0:
+        return None
+
+    email = (
+        result.stdout.strip().splitlines()[-1]
+        if result.stdout.strip()
+        else ""
+    )
+
+    if not email:
+        return None
+
+    _validate_email(email)
+    return email
+
+
+def _poll_agentmail(timeout: int) -> Optional[str]:
+    """Generic polling loop for verification URL."""
+    start = time.time()
+
+    while time.time() - start < timeout:
+        try:
+            result = subprocess.run(
+                [sys.executable, str(AGENTMAIL_SCRIPT), "check"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                url = result.stdout.strip().splitlines()[-1]
+
+                if (
+                    HF_CONFIRMATION_URL_PREFIX in url
+                    or "huggingface.co/email_confirmation" in url
+                ):
+                    return url
+
+        except Exception:
+            pass
+
+        time.sleep(EMAIL_POLL_INTERVAL)
+
+    return None
+
+
+def poll_verification_email(timeout: int = 7) -> Optional[str]:
+    """Poll for verification email for exactly `timeout` seconds."""
+    return _poll_agentmail(timeout)
+
+
+def poll_verification_email_long(
+    timeout: int = EMAIL_POLL_TIMEOUT,
+) -> Optional[str]:
+    return _poll_agentmail(timeout)
 
 
 async def _fill_and_verify(page, selector: str, selector_alt: str, value: str, field_name: str, timeout: int = 15000, verbose: bool = True):

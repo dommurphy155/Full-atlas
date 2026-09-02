@@ -129,7 +129,7 @@ OPENROUTER_CONFIG = ProviderConfig(
     name="openrouter",
     base_url=OPENROUTER_BASE_URL,
     key_prefix="sk-",
-    default_model=_env("ATLAS_OPENROUTER_MODEL", _env("OPENROUTER_MODEL", "poolside/laguna-s-2.1:free")),
+    default_model=_env("ATLAS_OPENROUTER_MODEL", _env("OPENROUTER_MODEL", "z-ai/glm-5.2:free")),
     key_file=KEY_FILE,
     dead_keys_file=FALLBACK_KEY_FILE,
     key_label="OpenRouter",
@@ -209,7 +209,7 @@ def _load_or_default_model() -> str:
     model = _load_runtime_model()
     if model:
         return model
-    return _env("ATLAS_OPENROUTER_MODEL", _env("OPENROUTER_MODEL", "poolside/laguna-s-2.1:free"))
+    return _env("ATLAS_OPENROUTER_MODEL", _env("OPENROUTER_MODEL", "z-ai/glm-5.2:free"))
 
 
 OPENROUTER_MODEL: str = _load_or_default_model()
