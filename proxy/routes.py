@@ -389,6 +389,7 @@ def _dump_payload(rid: str, tag: str, body: Any) -> str:
     try:
         with open(path, "w") as f:
             f.write(orjson.dumps(body, option=orjson.OPT_INDENT_2).decode())
+        log.info("req=%s payload_saved %s (%d bytes)", rid, path, os.path.getsize(path))
     except Exception:
         return ""
     return path
