@@ -187,7 +187,6 @@ async def responses_api(request: Request) -> Response:
             headers={"x-request-id": rid},
         )
 
-    _dump_payload(rid, "_raw", body)
 
     # Convert Responses API shape (input/instructions) to chat messages
     if "input" in body or "instructions" in body:
@@ -380,9 +379,6 @@ async def responses_api(request: Request) -> Response:
                     })
 
         full_text = "".join(text_so_far)
-        log.warning("req=%s FINAL_TEXT tool_calls=%d text=%s", rid, len(tool_call_state), full_text[:500])
-        for _idx, _tc in tool_call_state.items():
-            log.warning("req=%s TOOL_CALL_FINAL idx=%d id=%s name=%s args=%s", rid, _idx, _tc["id"], _tc["name"], _tc["args"][:300])
 
         for idx, tc in tool_call_state.items():
             yield _sse_event("response.function_call_arguments.done", {
