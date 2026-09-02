@@ -479,6 +479,9 @@ CORS_ORIGINS: List[str] = [
 # ---------------------------------------------------------------------------
 UPSTREAM_REFERER: str = _env("ATLAS_UPSTREAM_REFERER", "https://localhost:8788")
 UPSTREAM_TITLE: str = _env("ATLAS_UPSTREAM_TITLE", "Atlas-Translation-Proxy")
+SAVE_PAYLOAD_FILES: bool = _env_bool("ATLAS_SAVE_PAYLOAD_FILES", True)
+"""If True, write incoming request payloads to PAYLOAD_DIR for debugging."""
+PAYLOAD_DIR: str = _env("ATLAS_PAYLOAD_DIR", "/tmp/atlas_payloads")
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +740,7 @@ __all__ = [
     "CORS_ORIGINS",
     # Debug / upstream
     "UPSTREAM_REFERER", "UPSTREAM_TITLE",
+    "SAVE_PAYLOAD_FILES", "PAYLOAD_DIR",
     # Logging
     "LOG_LEVEL", "LOG_JSON", "LOG_REQUEST_ID", "get_logger", "log",
     # Key lifecycle management

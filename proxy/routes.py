@@ -15,7 +15,9 @@ from .config import (
     LISTEN_PORT,
     MAX_RETRIES,
     MODEL_CONTEXT_WINDOW,
+    PAYLOAD_DIR,
     PROVIDER,
+    SAVE_PAYLOAD_FILES,
     get_chat_url,
     get_messages_url,
     get_default_model,
@@ -196,6 +198,7 @@ async def chat_completions(request: Request) -> Response:
     stream = bool(body.get("stream", False))
     payload = dumps(body)
 
+    _payload_path = _dump_payload(rid, "", body)
 
     tr = pl.trace(rid)  # logging-only lifecycle trace
     tr.start("openai", body.get("model"), "chat/completions", stream)
@@ -244,6 +247,7 @@ async def messages(request: Request) -> Response:
     stream = bool(body.get("stream", False))
     payload = dumps(body)
 
+    _payload_path = _dump_payload(rid, "_messages", body)
 
     tr = pl.trace(rid)  # logging-only lifecycle trace
     tr.start("anthropic", body.get("model"), "messages", stream)
@@ -368,5 +372,25 @@ def _sse_event(event: str, data: dict) -> bytes:
     if isinstance(raw, (bytes, bytearray)):
         raw = raw.decode("utf-8")
     return f"event: {event}\ndata: {raw}\n\n".encode("utf-8")
+
+
+def _dump_payload(rid: str, tag: str, body: Any) -> str:
+    """Write the request payload to PAYLOAD_DIR when SAVE_PAYLOAD_FILES is on.
+
+    Returns the path written ("" when disabled or on failure). Never raises.
+    """
+    if not SAVE_PAYLOAD_FILES:
+        return ""
+    import os
+    import orjson
+
+    os.makedirs(PAYLOAD_DIR, exist_ok=True)
+    path = os.path.join(PAYLOAD_DIR, f"payload_{rid}{tag}.json")
+    try:
+        with open(path, "w") as f:
+            f.write(orjson.dumps(body, option=orjson.OPT_INDENT_2).decode())
+    except Exception:
+        return ""
+    return path
 
 
