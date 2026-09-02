@@ -163,6 +163,7 @@ async def models(request: Request) -> Response:
     return JSONResponse(data, headers={"x-request-id": rid})
 
 
+@router.post("/v1/responses")
 @router.post("/v1/chat/completions")
 @router.post("/chat/completions")
 async def chat_completions(request: Request) -> Response:
