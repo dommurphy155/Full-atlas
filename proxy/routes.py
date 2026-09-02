@@ -163,7 +163,308 @@ async def models(request: Request) -> Response:
     return JSONResponse(data, headers={"x-request-id": rid})
 
 
+
 @router.post("/v1/responses")
+async def responses_api(request: Request) -> Response:
+    """OpenAI Responses API endpoint - translates chat/completions SSE into
+    proper Responses API SSE events (response.created / output_item /
+    content_part / output_text.delta / .done / response.completed)."""
+    assert proxy is not None
+    rid = request_id(request)
+    try:
+        body = loads(await request.body())
+    except Exception:
+        return JSONResponse(
+            {"error": {"message": "invalid json", "type": "invalid_request_error"}},
+            status_code=400,
+            headers={"x-request-id": rid},
+        )
+
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"error": {"message": "body must be object", "type": "invalid_request_error"}},
+            status_code=400,
+            headers={"x-request-id": rid},
+        )
+
+    _dump_payload(rid, "_raw", body)
+
+    # Convert Responses API shape (input/instructions) to chat messages
+    if "input" in body or "instructions" in body:
+        msgs = []
+        instructions = body.pop("instructions", None)
+        if instructions:
+            msgs.append({"role": "system", "content": instructions})
+        for item in body.pop("input", []) or []:
+            itype = item.get("type")
+
+            if itype == "function_call":
+                msgs.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": item.get("call_id"),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name"),
+                            "arguments": item.get("arguments", ""),
+                        },
+                    }],
+                })
+                continue
+
+            if itype == "function_call_output":
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id"),
+                    "content": item.get("output", ""),
+                })
+                continue
+
+            role = item.get("role", "user")
+            if role == "developer":
+                role = "system"
+            parts = item.get("content", [])
+            text = "\n".join(
+                p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")
+            )
+            if text:
+                msgs.append({"role": role, "content": text})
+        if msgs:
+            body["messages"] = msgs
+
+    # Responses-only structured output (title gen etc) - drop, chat/completions
+    # doesn't support text.format json_schema the same way
+    body.pop("text", None)
+    body.pop("store", None)
+    body.pop("include", None)
+
+    body = prepare_chat_body(body)
+    stream = bool(body.get("stream", False))
+    payload = dumps(body)
+    _payload_path = _dump_payload(rid, "", body)
+
+    tr = pl.trace(rid)
+    tr.start("openai", body.get("model"), "responses", stream)
+
+    resp = await proxy.forward(
+        "POST",
+        get_chat_url(),
+        body=payload,
+        stream=stream,
+        request_id=rid,
+    )
+
+    if not stream or not hasattr(resp, "body_iterator"):
+        return resp
+
+    response_id = f"resp_{rid}"
+    item_id = f"msg_{rid}"
+    model_name = body.get("model")
+
+    async def translate_stream():
+        text_so_far = []
+        started_item = False
+        buf = b""
+        tool_call_state = {}
+
+        yield _sse_event("response.created", {
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "status": "in_progress",
+                "model": model_name,
+            },
+        })
+
+        async for raw in resp.body_iterator:
+            if not raw:
+                continue
+            chunk = raw if isinstance(raw, (bytes, bytearray)) else raw.encode("utf-8")
+            buf += chunk
+
+            # Split on double-newline SSE frame boundaries; keep remainder buffered
+            while b"\n\n" in buf:
+                frame, buf = buf.split(b"\n\n", 1)
+                data_line = None
+                for line in frame.split(b"\n"):
+                    line = line.strip()
+                    if line.startswith(b"data:"):
+                        data_line = line[5:].strip()
+                        break
+                if data_line is None:
+                    continue
+                if data_line == b"[DONE]":
+                    continue
+                try:
+                    data = loads(data_line)
+                except Exception:
+                    continue
+
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}) or {}
+
+                tool_calls = delta.get("tool_calls")
+                if tool_calls:
+                    for tc in tool_calls:
+                        idx = tc.get("index", 0)
+                        call_id = tc.get("id")
+                        fn = tc.get("function", {}) or {}
+                        name = fn.get("name")
+                        args_piece = fn.get("arguments", "")
+
+                        if idx not in tool_call_state:
+                            tool_call_state[idx] = {
+                                "id": call_id or f"call_{rid}_{idx}",
+                                "name": name or "",
+                                "args": "",
+                            }
+                            yield _sse_event("response.output_item.added", {
+                                "type": "response.output_item.added",
+                                "output_index": idx + 1,
+                                "item": {
+                                    "id": f"fc_{tool_call_state[idx]['id']}",
+                                    "call_id": tool_call_state[idx]["id"],
+                                    "type": "function_call",
+                                    "status": "in_progress",
+                                    "name": tool_call_state[idx]["name"],
+                                    "arguments": "",
+                                },
+                            })
+
+                        if name and not tool_call_state[idx]["name"]:
+                            tool_call_state[idx]["name"] = name
+
+                        if args_piece:
+                            tool_call_state[idx]["args"] += args_piece
+                            yield _sse_event("response.function_call_arguments.delta", {
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": tool_call_state[idx]["id"],
+                                "output_index": idx + 1,
+                                "delta": args_piece,
+                            })
+
+                content = delta.get("content")
+                if content:
+                    if not started_item:
+                        yield _sse_event("response.output_item.added", {
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {
+                                "id": item_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "in_progress",
+                                "content": [],
+                            },
+                        })
+                        yield _sse_event("response.content_part.added", {
+                            "type": "response.content_part.added",
+                            "item_id": item_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": ""},
+                        })
+                        started_item = True
+
+                    text_so_far.append(content)
+                    yield _sse_event("response.output_text.delta", {
+                        "type": "response.output_text.delta",
+                        "item_id": item_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": content,
+                    })
+
+        full_text = "".join(text_so_far)
+        log.warning("req=%s FINAL_TEXT tool_calls=%d text=%s", rid, len(tool_call_state), full_text[:500])
+        for _idx, _tc in tool_call_state.items():
+            log.warning("req=%s TOOL_CALL_FINAL idx=%d id=%s name=%s args=%s", rid, _idx, _tc["id"], _tc["name"], _tc["args"][:300])
+
+        for idx, tc in tool_call_state.items():
+            yield _sse_event("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "item_id": tc["id"],
+                "output_index": idx + 1,
+                "arguments": tc["args"],
+            })
+            yield _sse_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": idx + 1,
+                "item": {
+                    "id": f"fc_{tc['id']}",
+                    "call_id": tc["id"],
+                    "type": "function_call",
+                    "status": "completed",
+                    "name": tc["name"],
+                    "arguments": tc["args"],
+                },
+            })
+
+        if started_item:
+            yield _sse_event("response.output_text.done", {
+                "type": "response.output_text.done",
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": full_text,
+            })
+            yield _sse_event("response.content_part.done", {
+                "type": "response.content_part.done",
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": full_text},
+            })
+            yield _sse_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": full_text}],
+                },
+            })
+
+        final_output = []
+        for idx, tc in tool_call_state.items():
+            final_output.append({
+                "id": f"fc_{tc['id']}",
+                "call_id": tc["id"],
+                "type": "function_call",
+                "status": "completed",
+                "name": tc["name"],
+                "arguments": tc["args"],
+            })
+        if started_item:
+            final_output.append({
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": full_text}],
+            })
+
+        yield _sse_event("response.completed", {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "model": model_name,
+                "output": final_output,
+            },
+        })
+
+    return StreamingResponse(translate_stream(), media_type="text/event-stream")
+
+
+
 @router.post("/v1/chat/completions")
 @router.post("/chat/completions")
 async def chat_completions(request: Request) -> Response:

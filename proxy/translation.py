@@ -284,13 +284,14 @@ def anthropic_tools_to_openai(tools: Optional[List[Dict]]) -> Optional[List[Dict
     for t in tools:
         if not isinstance(t, dict):
             continue
-        # Already OpenAI-shaped (or OpenRouter server tool)
-        if t.get("type") in ("function", "openrouter:web_search", "openrouter:datetime",
-                             "openrouter:image_generation", "openrouter:web_fetch",
-                             "openrouter:apply_patch", "openrouter:shell", "openrouter:fusion"):
+        # Already OpenAI chat-shaped: {"type": "function", "function": {...}}
+        if t.get("type") == "function" and isinstance(t.get("function"), dict):
             out.append(t)
             continue
-        if t.get("type") == "function" and "function" in t:
+        # OpenRouter server tools passthrough (never have a "function" key)
+        if t.get("type") in ("openrouter:web_search", "openrouter:datetime",
+                             "openrouter:image_generation", "openrouter:web_fetch",
+                             "openrouter:apply_patch", "openrouter:shell", "openrouter:fusion"):
             out.append(t)
             continue
         # Anthropic custom / server tool passthrough when it already has type
@@ -1281,6 +1282,11 @@ def prepare_chat_body(body: Dict[str, Any]) -> Dict[str, Any]:
 
     # Work on a shallow copy so we never mutate the caller's dict
     body = dict(body)
+
+    # ----- Codex / empty request handling -----
+    if not body.get("messages") and not body.get("prompt"):
+        session_id = body.get("client_metadata", {}).get("session_id", "unknown")
+        body["messages"] = [{"role": "user", "content": f"[Codex session {session_id}]"}]
 
     # Model resolution: per-provider force flag (default True) overrides every
     # request to the provider's default model. When False, the client's model
