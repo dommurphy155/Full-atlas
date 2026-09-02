@@ -50,7 +50,7 @@ Or from a downloaded/cloned copy of this repository:
 The installer:
 1. Detects your OS (Windows is rejected cleanly)
 2. Creates the virtualenv and installs dependencies in the background
-3. Asks which harness you use — Claude Code, Codex, or Hermes — and wires it to the proxy (`ANTHROPIC_BASE_URL`, `~/.codex/config.toml`, or `hermes config set` respectively)
+3. Asks which harness you use — Claude Code or Hermes — and wires it to the proxy (`ANTHROPIC_BASE_URL` or `hermes config set`)
 4. Recommends pasting one OpenRouter API key from your main account so the proxy works even if the signup bots hit issues
 5. Starts the proxy as a background daemon and health-checks it
 6. Drops you straight into your harness, ready to send a prompt
@@ -138,7 +138,7 @@ atlas logs all
 
 ### Overview
 
-The proxy (`proxy/`) is a FastAPI application that sits between an AI coding harness (Claude Code, Codex, etc.) and OpenRouter. It accepts both OpenAI-compatible and Anthropic-compatible request shapes and forwards them to OpenRouter's API using automatically-rotated API keys.
+The proxy (`proxy/`) is a FastAPI application that sits between an AI coding harness (Claude Code, Hermes, etc.) and OpenRouter. It accepts both OpenAI-compatible and Anthropic-compatible request shapes and forwards them to OpenRouter's API using automatically-rotated API keys.
 
 ### Running
 
@@ -163,8 +163,6 @@ Listen address defaults to `0.0.0.0:8788` (see Configuration below).
 | `GET`  | `/v1/models`           | Anthropic-shaped model list (stub models for Claude Code UI)            |
 | `POST` | `/v1/chat/completions` | OpenAI chat completions → OpenRouter chat                               |
 | `POST` | `/v1/messages`         | Anthropic messages → OpenRouter messages                                |
-| `POST` | `/v1/responses`        | OpenAI Responses API → OpenRouter chat (with SSE streaming translation) |
-| `WS`   | `/v1/responses`        | WebSocket tunnel for Responses API                                      |
 
 ### Key Pool & Rotation
 
@@ -179,8 +177,6 @@ Listen address defaults to `0.0.0.0:8788` (see Configuration below).
 The proxy normalizes between APIs:
 
 - **Anthropic ↔ OpenAI messages**: converts between Anthropic content blocks and OpenAI message arrays (tool_use, tool_result, thinking blocks, image blocks).
-- **Responses API ↔ Chat Completions**: translates OpenAI Responses API requests into Chat Completions payloads, and translates the SSE response stream back into Responses events (`response.output_text.delta`, `response.function_call_arguments.delta`, etc.).
-- **Tool call promotion**: free-tier models that emit tool calls as plain text are parsed and promoted to native `tool_calls`.
 - **Model forcing**: `FORCE_DEFAULT_MODEL` always overrides the requested model to the configured default (`pools/base` free model).
 
 ### System Prompt Override

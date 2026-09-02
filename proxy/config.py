@@ -121,7 +121,6 @@ OPENROUTER_BASE_URL: str = _env(
 OPENROUTER_CHAT: str = f"{OPENROUTER_BASE_URL}/chat/completions"
 OPENROUTER_MESSAGES: str = f"{OPENROUTER_BASE_URL}/messages"
 OPENROUTER_MODELS: str = f"{OPENROUTER_BASE_URL}/models"
-OPENROUTER_RESPONSES: str = f"{OPENROUTER_BASE_URL}/responses"
 HF_BASE_URL: str = _env("ATLAS_HF_BASE_URL", "https://router.huggingface.co/v1")
 HF_KEY_PREFIX: str = "hf_"
 
@@ -397,20 +396,6 @@ so Claude Code triggers /compact at the right threshold (~85%)."""
 
 
 # ---------------------------------------------------------------------------
-# Text-to-tool promotion (free-tier model compensation)
-# ---------------------------------------------------------------------------
-PROMOTE_TEXT_TO_TOOLS: bool = _env_bool("ATLAS_PROMOTE_TEXT_TO_TOOLS", True)
-"""If True, promote JSON/XML/func-notation found in model text output to
-real tool_calls. Compensates for free-tier models that emit tool calls
-as prose. Disable for frontier models (Claude/GPT via OpenRouter) that
-reliably emit native tool_calls.
-
-WARNING: When True, the JSON brace scanner may strip well-formed objects
-from assistant prose (e.g. JSON config examples). Disable for models that
-never produce text-based tool calls."""
-
-
-# ---------------------------------------------------------------------------
 # Non-streaming response size cap
 # ---------------------------------------------------------------------------
 MAX_RESPONSE_BYTES: int = _env_int("ATLAS_MAX_RESPONSE_BYTES", _env_int("MAX_RESPONSE_BYTES", 0))
@@ -490,12 +475,8 @@ CORS_ORIGINS: List[str] = [
 
 
 # ---------------------------------------------------------------------------
-# Debug / upstream identity / payload saving
+# Debug / upstream identity
 # ---------------------------------------------------------------------------
-DEBUG_CODEX_BODY: bool = _env_bool("ATLAS_DEBUG_CODEX_BODY", False)
-SAVE_PAYLOAD_FILES: bool = _env_bool("ATLAS_SAVE_PAYLOAD_FILES", False)
-"""If True, write incoming request payloads to PAYLOAD_DIR for debugging."""
-PAYLOAD_DIR: str = _env("ATLAS_PAYLOAD_DIR", "/tmp/atlas_payloads")
 UPSTREAM_REFERER: str = _env("ATLAS_UPSTREAM_REFERER", "https://localhost:8788")
 UPSTREAM_TITLE: str = _env("ATLAS_UPSTREAM_TITLE", "Atlas-Translation-Proxy")
 
@@ -723,7 +704,7 @@ __all__ = [
     "ProviderConfig", "PROVIDERS",
     "PROVIDER", "get_provider", "get_provider_config",
     "OPENROUTER_BASE_URL", "OPENROUTER_CHAT", "OPENROUTER_MESSAGES",
-    "OPENROUTER_MODELS", "OPENROUTER_RESPONSES",
+    "OPENROUTER_MODELS",
     "OPENROUTER_MODEL", "OPENROUTER_CONFIG",
     "HF_BASE_URL", "HF_DEFAULT_MODEL", "HF_MODEL", "HF_KEY_PREFIX", "HF_CONFIG",
     # Model override
@@ -745,9 +726,7 @@ __all__ = [
     "PROXY_KEEPALIVE_SECONDS", "FREE_MODEL_MAX_CONCURRENT",
     "MAX_CONCURRENT_PER_KEY", "STICKY_MAX_USES",
     # Context window safety
-    "MAX_INPUT_TOKENS", "MAX_TOKEN_TRIM_KEEP_SYSTEM", "MODEL_CONTEXT_WINDOW",
-    # Text-to-tool promotion
-    "PROMOTE_TEXT_TO_TOOLS",
+        "MAX_INPUT_TOKENS", "MAX_TOKEN_TRIM_KEEP_SYSTEM", "MODEL_CONTEXT_WINDOW",
     # Response size cap
     "MAX_RESPONSE_BYTES",
     # System prompt override
@@ -756,8 +735,7 @@ __all__ = [
     "reload_system_prompt_override",
     # CORS
     "CORS_ORIGINS",
-    # Debug / upstream / payload
-    "DEBUG_CODEX_BODY", "SAVE_PAYLOAD_FILES", "PAYLOAD_DIR",
+    # Debug / upstream
     "UPSTREAM_REFERER", "UPSTREAM_TITLE",
     # Logging
     "LOG_LEVEL", "LOG_JSON", "LOG_REQUEST_ID", "get_logger", "log",

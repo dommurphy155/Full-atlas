@@ -113,7 +113,7 @@ BANNER = r"""
 
 WELCOME = (
     "Welcome to Atlas.\n\n"
-    "Run any AI coding agent — Claude Code, Codex, Hermes — against\n"
+    "Run any AI coding agent — Claude Code or Hermes — against\n"
     "frontier models with [bold cyan]zero API bills[/bold cyan].\n"
     "A local proxy pools and rotates free-tier API keys automatically,\n"
     "and signup bots keep the pool topped up while you work."
@@ -307,38 +307,6 @@ def configure_claude_code() -> str | None:
     return "claude"
 
 
-def configure_codex() -> str | None:
-    """Write ~/.codex/config.toml provider block pointing at the proxy."""
-    codex_dir = Path.home() / ".codex"
-    cfg = codex_dir / "config.toml"
-    codex_dir.mkdir(exist_ok=True)
-
-    block = """
-# --- begin atlas provider ---
-model_provider = "atlas"
-
-[model_providers.atlas]
-name = "Atlas Proxy"
-base_url = "http://127.0.0.1:8788/v1"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"
-requires_openai_auth = false
-request_max_retries = 4
-# --- end atlas provider ---
-"""
-    existing = cfg.read_text() if cfg.exists() else ""
-    if "# --- begin atlas provider ---" in existing:
-        console.print("  Codex already configured for Atlas")
-    elif existing.strip():
-        # preserve user content, replace any prior atlas block, append ours
-        console.print("  Appending Atlas provider to existing Codex config")
-        cfg.write_text(existing.rstrip() + "\n" + block)
-    else:
-        cfg.write_text(block.lstrip())
-    console.print("  ~/.codex/config.toml -> Atlas proxy (Responses API)")
-    return "codex"
-
-
 def configure_hermes() -> str | None:
     """Point Hermes at the proxy via its documented custom-endpoint keys."""
     hermes_bin = subprocess.run(
@@ -373,7 +341,6 @@ def configure_hermes() -> str | None:
 
 HARNESSES = {
     "claude code": ("Claude Code", configure_claude_code),
-    "codex": ("Codex", configure_codex),
     "hermes": ("Hermes", configure_hermes),
 }
 
@@ -805,7 +772,7 @@ def main() -> None:
         launch_harness(launch_cmd)
     else:
         console.print("\n[green]Setup complete.[/green] Start your harness anytime:")
-        console.print("  claude | codex | hermes")
+        console.print("  claude | hermes")
 
 
 if __name__ == "__main__":
