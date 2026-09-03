@@ -220,8 +220,31 @@ async def responses_api(request: Request) -> Response:
                 })
                 continue
 
-            # Codex uses custom_tool_call (freeform tools, e.g. apply_patch)
+            # Codex uses custom_tool_call (freeform tools, e.g. apply_patch).
+            #
+            # The synthesized tool schema in translation.py declares a single
+            # `input` field, so arguments MUST be a JSON-encoded object like
+            # {"input": "<patch text>"} when the round-tripped assistant
+            # message reaches OpenRouter. Codex stores the raw patch in
+            # item["input"] -- we wrap it in the schema-shaped object and
+            # JSON-encode the whole thing so chat/completions parses it.
+            #
+            # If the stored input already looks like a JSON object (legacy
+            # function-style custom tools), pass it through JSON-encoded as-is.
             if itype == "custom_tool_call":
+                import json as _json
+                raw_input = item.get("input", "")
+                if isinstance(raw_input, str) and raw_input.strip().startswith("{"):
+                    try:
+                        parsed = _json.loads(raw_input)
+                        if isinstance(parsed, dict):
+                            args_str = raw_input
+                        else:
+                            args_str = _json.dumps({"input": raw_input})
+                    except Exception:
+                        args_str = _json.dumps({"input": raw_input})
+                else:
+                    args_str = _json.dumps({"input": raw_input})
                 msgs.append({
                     "role": "assistant",
                     "content": None,
@@ -230,7 +253,7 @@ async def responses_api(request: Request) -> Response:
                         "type": "function",
                         "function": {
                             "name": item.get("name"),
-                            "arguments": item.get("input", ""),
+                            "arguments": args_str,
                         },
                     }],
                 })
@@ -244,8 +267,24 @@ async def responses_api(request: Request) -> Response:
                 })
                 continue
 
-            # OpenAI hosted apply_patch tool wire format
+            # OpenAI hosted apply_patch tool wire format.
+            # The diff payload lives at item["input"] on the Responses API.
+            # Older payloads (and some forks) used item["operation"]["diff"];
+            # fall back to that so we do not break previously-recorded
+            # conversation history.
+            #
+            # arguments must be a JSON-encoded object {"input": "<diff>"} to
+            # match the synthesized schema in translation.py. If the stored
+            # payload already looks like a JSON object, pass it through as-is.
             if itype == "apply_patch_call":
+                import json as _json
+                raw = item.get("input")
+                if raw is None:
+                    raw = item.get("operation", {}).get("diff", "")
+                if isinstance(raw, str) and raw.strip().startswith("{"):
+                    args_str = raw  # already a JSON object string
+                else:
+                    args_str = _json.dumps({"input": raw})
                 msgs.append({
                     "role": "assistant",
                     "content": None,
@@ -254,7 +293,7 @@ async def responses_api(request: Request) -> Response:
                         "type": "function",
                         "function": {
                             "name": "apply_patch",
-                            "arguments": item.get("operation", {}).get("diff", ""),
+                            "arguments": args_str,
                         },
                     }],
                 })
