@@ -294,6 +294,71 @@ def anthropic_tools_to_openai(tools: Optional[List[Dict]]) -> Optional[List[Dict
                              "openrouter:apply_patch", "openrouter:shell", "openrouter:fusion"):
             out.append(t)
             continue
+        # Codex apply_patch is a FREEFORM tool with a Lark grammar, not a JSON
+        # schema. Upstream models don't speak Lark, so we synthesize an equivalent
+        # JSON function tool with one `input: string` parameter that carries the
+        # patch text. This gives the model a real schema to emit
+        # {"input": "*** Begin Patch ... *** End Patch"} into.
+        if t.get("type") == "freeform" and t.get("name") == "apply_patch":
+            json_desc = (
+                "Use the `apply_patch` tool to edit files. "
+                "Arguments MUST be a JSON object with a single string field "
+                "`input` containing the entire apply_patch command, formatted as:\n"
+                "*** Begin Patch\n[YOUR_PATCH]\n*** End Patch\n"
+                "Where [YOUR_PATCH] uses headers *** Add File:, *** Update File:, "
+                "*** Delete File: and @@ hunks. File references are relative."
+            )
+            original_desc = t.get("description")
+            desc = (original_desc + "\n\n" + json_desc) if original_desc else json_desc
+            out.append({
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "description": desc,
+                    "strict": False,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": "The entire contents of the apply_patch command, wrapped in *** Begin Patch ... *** End Patch.",
+                            },
+                        },
+                        "required": ["input"],
+                        "additionalProperties": False,
+                    },
+                },
+            })
+            continue
+        # Codex apply_patch hosted-tool form: bare {"type":"apply_patch"} without
+        # parameters. Synthesize the same JSON function tool as above.
+        if t.get("type") == "apply_patch" and "name" not in t:
+            out.append({
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "description": (
+                        "Apply unified diffs to files. Arguments MUST be a JSON object "
+                        "with a single string field `input` containing the entire "
+                        "apply_patch command (*** Begin Patch ... *** End Patch)."
+                    ),
+                    "strict": False,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "input": {"type": "string"},
+                        },
+                        "required": ["input"],
+                        "additionalProperties": False,
+                    },
+                },
+            })
+            continue
+        # Other freeform/custom tools: pass through verbatim (upstream may not
+        # understand them, but we won't mangle them either).
+        if t.get("type") in ("freeform", "custom"):
+            out.append(t)
+            continue
         # Anthropic custom / server tool passthrough when it already has type
         if "type" in t and t["type"] not in (None, "function") and "name" not in t:
             out.append(t)

@@ -220,6 +220,54 @@ async def responses_api(request: Request) -> Response:
                 })
                 continue
 
+            # Codex uses custom_tool_call (freeform tools, e.g. apply_patch)
+            if itype == "custom_tool_call":
+                msgs.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": item.get("call_id"),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name"),
+                            "arguments": item.get("input", ""),
+                        },
+                    }],
+                })
+                continue
+
+            if itype == "custom_tool_call_output":
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id"),
+                    "content": item.get("output", ""),
+                })
+                continue
+
+            # OpenAI hosted apply_patch tool wire format
+            if itype == "apply_patch_call":
+                msgs.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": item.get("call_id"),
+                        "type": "function",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": item.get("operation", {}).get("diff", ""),
+                        },
+                    }],
+                })
+                continue
+
+            if itype == "apply_patch_call_output":
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id"),
+                    "content": item.get("output", ""),
+                })
+                continue
+
             role = item.get("role", "user")
             if role == "developer":
                 role = "system"
@@ -314,37 +362,62 @@ async def responses_api(request: Request) -> Response:
                         fn = tc.get("function", {}) or {}
                         name = fn.get("name")
                         args_piece = fn.get("arguments", "")
+                        is_apply_patch = name == "apply_patch"
 
                         if idx not in tool_call_state:
                             tool_call_state[idx] = {
                                 "id": call_id or f"call_{rid}_{idx}",
                                 "name": name or "",
                                 "args": "",
+                                "is_apply_patch": is_apply_patch,
                             }
-                            yield _sse_event("response.output_item.added", {
-                                "type": "response.output_item.added",
-                                "output_index": idx + 1,
-                                "item": {
-                                    "id": f"fc_{tool_call_state[idx]['id']}",
-                                    "call_id": tool_call_state[idx]["id"],
-                                    "type": "function_call",
-                                    "status": "in_progress",
-                                    "name": tool_call_state[idx]["name"],
-                                    "arguments": "",
-                                },
-                            })
+                            if is_apply_patch:
+                                yield _sse_event("response.output_item.added", {
+                                    "type": "response.output_item.added",
+                                    "output_index": idx + 1,
+                                    "item": {
+                                        "id": f"ctc_{tool_call_state[idx]['id']}",
+                                        "call_id": tool_call_state[idx]["id"],
+                                        "type": "custom_tool_call",
+                                        "status": "in_progress",
+                                        "name": "apply_patch",
+                                        "input": "",
+                                    },
+                                })
+                            else:
+                                yield _sse_event("response.output_item.added", {
+                                    "type": "response.output_item.added",
+                                    "output_index": idx + 1,
+                                    "item": {
+                                        "id": f"fc_{tool_call_state[idx]['id']}",
+                                        "call_id": tool_call_state[idx]["id"],
+                                        "type": "function_call",
+                                        "status": "in_progress",
+                                        "name": tool_call_state[idx]["name"],
+                                        "arguments": "",
+                                    },
+                                })
 
                         if name and not tool_call_state[idx]["name"]:
                             tool_call_state[idx]["name"] = name
+                            tool_call_state[idx]["is_apply_patch"] = is_apply_patch
 
                         if args_piece:
                             tool_call_state[idx]["args"] += args_piece
-                            yield _sse_event("response.function_call_arguments.delta", {
-                                "type": "response.function_call_arguments.delta",
-                                "item_id": tool_call_state[idx]["id"],
-                                "output_index": idx + 1,
-                                "delta": args_piece,
-                            })
+                            if tool_call_state[idx]["is_apply_patch"]:
+                                yield _sse_event("response.custom_tool_call_arguments.delta", {
+                                    "type": "response.custom_tool_call_arguments.delta",
+                                    "item_id": tool_call_state[idx]["id"],
+                                    "output_index": idx + 1,
+                                    "delta": args_piece,
+                                })
+                            else:
+                                yield _sse_event("response.function_call_arguments.delta", {
+                                    "type": "response.function_call_arguments.delta",
+                                    "item_id": tool_call_state[idx]["id"],
+                                    "output_index": idx + 1,
+                                    "delta": args_piece,
+                                })
 
                 content = delta.get("content")
                 if content:
@@ -381,24 +454,44 @@ async def responses_api(request: Request) -> Response:
         full_text = "".join(text_so_far)
 
         for idx, tc in tool_call_state.items():
-            yield _sse_event("response.function_call_arguments.done", {
-                "type": "response.function_call_arguments.done",
-                "item_id": tc["id"],
-                "output_index": idx + 1,
-                "arguments": tc["args"],
-            })
-            yield _sse_event("response.output_item.done", {
-                "type": "response.output_item.done",
-                "output_index": idx + 1,
-                "item": {
-                    "id": f"fc_{tc['id']}",
-                    "call_id": tc["id"],
-                    "type": "function_call",
-                    "status": "completed",
-                    "name": tc["name"],
+            if tc.get("is_apply_patch"):
+                yield _sse_event("response.custom_tool_call_arguments.done", {
+                    "type": "response.custom_tool_call_arguments.done",
+                    "item_id": tc["id"],
+                    "output_index": idx + 1,
+                    "input": tc["args"],
+                })
+                yield _sse_event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": idx + 1,
+                    "item": {
+                        "id": f"ctc_{tc['id']}",
+                        "call_id": tc["id"],
+                        "type": "custom_tool_call",
+                        "status": "completed",
+                        "name": "apply_patch",
+                        "input": tc["args"],
+                    },
+                })
+            else:
+                yield _sse_event("response.function_call_arguments.done", {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": tc["id"],
+                    "output_index": idx + 1,
                     "arguments": tc["args"],
-                },
-            })
+                })
+                yield _sse_event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": idx + 1,
+                    "item": {
+                        "id": f"fc_{tc['id']}",
+                        "call_id": tc["id"],
+                        "type": "function_call",
+                        "status": "completed",
+                        "name": tc["name"],
+                        "arguments": tc["args"],
+                    },
+                })
 
         if started_item:
             yield _sse_event("response.output_text.done", {
@@ -429,14 +522,24 @@ async def responses_api(request: Request) -> Response:
 
         final_output = []
         for idx, tc in tool_call_state.items():
-            final_output.append({
-                "id": f"fc_{tc['id']}",
-                "call_id": tc["id"],
-                "type": "function_call",
-                "status": "completed",
-                "name": tc["name"],
-                "arguments": tc["args"],
-            })
+            if tc.get("is_apply_patch"):
+                final_output.append({
+                    "id": f"ctc_{tc['id']}",
+                    "call_id": tc["id"],
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "name": "apply_patch",
+                    "input": tc["args"],
+                })
+            else:
+                final_output.append({
+                    "id": f"fc_{tc['id']}",
+                    "call_id": tc["id"],
+                    "type": "function_call",
+                    "status": "completed",
+                    "name": tc["name"],
+                    "arguments": tc["args"],
+                })
         if started_item:
             final_output.append({
                 "id": item_id,
