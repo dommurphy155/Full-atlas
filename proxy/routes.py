@@ -32,6 +32,67 @@ log = get_logger(__name__)
 
 router = APIRouter()
 
+
+# ---------------------------------------------------------------------------
+# Generic custom/freeform tool adaptation
+# ---------------------------------------------------------------------------
+
+_CUSTOM_TOOL_TYPES = frozenset({"custom", "freeform"})
+
+
+def _atlas_custom_tool_map(tools):
+    """Return request-local metadata for Codex custom/freeform tools."""
+    result = {}
+    if not isinstance(tools, list):
+        return result
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+
+        name = tool.get("name")
+        tool_type = tool.get("type")
+
+        if name and tool_type in _CUSTOM_TOOL_TYPES:
+            result[name] = {
+                "type": tool_type,
+                "name": name,
+            }
+
+        # Some Codex/OpenAI hosted-tool payloads use a bare type without name.
+        if tool_type == "apply_patch" and not name:
+            result["apply_patch"] = {
+                "type": "custom",
+                "name": "apply_patch",
+            }
+
+    return result
+
+
+def _atlas_unwrap_custom_tool_args(raw):
+    """Undo Atlas' internal JSON transport wrapper for custom/freeform tools."""
+    if not isinstance(raw, str):
+        return raw or ""
+
+    try:
+        parsed = loads(raw)
+    except Exception:
+        return raw
+
+    if isinstance(parsed, dict) and "input" in parsed:
+        value = parsed["input"]
+        return value if isinstance(value, str) else str(value)
+
+    return raw
+
+
+def _atlas_custom_tool_kind(name, custom_tools):
+    """Return original tool type, or None for an ordinary function tool."""
+    meta = custom_tools.get(name)
+    if isinstance(meta, dict):
+        return meta.get("type")
+    return None
+
 # Set by main.py during lifespan startup
 proxy: Optional[ProxyCore] = None
 
@@ -325,6 +386,10 @@ async def responses_api(request: Request) -> Response:
     body.pop("store", None)
     body.pop("include", None)
 
+    # Capture the original Codex tool kinds BEFORE prepare_chat_body()
+    # converts custom/freeform tools into OpenAI function tools.
+    original_custom_tools = _atlas_custom_tool_map(body.get("tools"))
+
     body = prepare_chat_body(body)
     stream = bool(body.get("stream", False))
     payload = dumps(body)
@@ -401,16 +466,17 @@ async def responses_api(request: Request) -> Response:
                         fn = tc.get("function", {}) or {}
                         name = fn.get("name")
                         args_piece = fn.get("arguments", "")
-                        is_apply_patch = name == "apply_patch"
+                        custom_kind = _atlas_custom_tool_kind(name, original_custom_tools)
 
                         if idx not in tool_call_state:
                             tool_call_state[idx] = {
                                 "id": call_id or f"call_{rid}_{idx}",
                                 "name": name or "",
                                 "args": "",
-                                "is_apply_patch": is_apply_patch,
+                                "custom_kind": custom_kind,
                             }
-                            if is_apply_patch:
+
+                            if custom_kind in _CUSTOM_TOOL_TYPES:
                                 yield _sse_event("response.output_item.added", {
                                     "type": "response.output_item.added",
                                     "output_index": idx + 1,
@@ -419,7 +485,7 @@ async def responses_api(request: Request) -> Response:
                                         "call_id": tool_call_state[idx]["id"],
                                         "type": "custom_tool_call",
                                         "status": "in_progress",
-                                        "name": "apply_patch",
+                                        "name": tool_call_state[idx]["name"],
                                         "input": "",
                                     },
                                 })
@@ -439,18 +505,14 @@ async def responses_api(request: Request) -> Response:
 
                         if name and not tool_call_state[idx]["name"]:
                             tool_call_state[idx]["name"] = name
-                            tool_call_state[idx]["is_apply_patch"] = is_apply_patch
+                            tool_call_state[idx]["custom_kind"] = (
+                                _atlas_custom_tool_kind(name, original_custom_tools)
+                            )
 
                         if args_piece:
                             tool_call_state[idx]["args"] += args_piece
-                            if tool_call_state[idx]["is_apply_patch"]:
-                                yield _sse_event("response.custom_tool_call_arguments.delta", {
-                                    "type": "response.custom_tool_call_arguments.delta",
-                                    "item_id": tool_call_state[idx]["id"],
-                                    "output_index": idx + 1,
-                                    "delta": args_piece,
-                                })
-                            else:
+
+                            if tool_call_state[idx]["custom_kind"] not in _CUSTOM_TOOL_TYPES:
                                 yield _sse_event("response.function_call_arguments.delta", {
                                     "type": "response.function_call_arguments.delta",
                                     "item_id": tool_call_state[idx]["id"],
@@ -493,13 +555,16 @@ async def responses_api(request: Request) -> Response:
         full_text = "".join(text_so_far)
 
         for idx, tc in tool_call_state.items():
-            if tc.get("is_apply_patch"):
+            if tc.get("custom_kind") in _CUSTOM_TOOL_TYPES:
+                custom_input = _atlas_unwrap_custom_tool_args(tc["args"])
+
                 yield _sse_event("response.custom_tool_call_arguments.done", {
                     "type": "response.custom_tool_call_arguments.done",
                     "item_id": tc["id"],
                     "output_index": idx + 1,
-                    "input": tc["args"],
+                    "input": custom_input,
                 })
+
                 yield _sse_event("response.output_item.done", {
                     "type": "response.output_item.done",
                     "output_index": idx + 1,
@@ -508,8 +573,8 @@ async def responses_api(request: Request) -> Response:
                         "call_id": tc["id"],
                         "type": "custom_tool_call",
                         "status": "completed",
-                        "name": "apply_patch",
-                        "input": tc["args"],
+                        "name": tc["name"],
+                        "input": custom_input,
                     },
                 })
             else:
@@ -561,14 +626,16 @@ async def responses_api(request: Request) -> Response:
 
         final_output = []
         for idx, tc in tool_call_state.items():
-            if tc.get("is_apply_patch"):
+            if tc.get("custom_kind") in _CUSTOM_TOOL_TYPES:
+                custom_input = _atlas_unwrap_custom_tool_args(tc["args"])
+
                 final_output.append({
                     "id": f"ctc_{tc['id']}",
                     "call_id": tc["id"],
                     "type": "custom_tool_call",
                     "status": "completed",
-                    "name": "apply_patch",
-                    "input": tc["args"],
+                    "name": tc["name"],
+                    "input": custom_input,
                 })
             else:
                 final_output.append({
