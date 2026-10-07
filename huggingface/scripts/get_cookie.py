@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -77,6 +78,17 @@ SCROLL_TIMEOUT_MS = 10_000
 # Cookie polling.
 COOKIE_POLL_INTERVAL_MS = 2_000
 COOKIE_POLL_ATTEMPTS = 30
+
+# Network capture produced after the "Set Cookie" click.
+NETWORK_CAPTURE_DIR = SCRIPT_DIR / "network_captures"
+
+SENSITIVE_HEADERS = {
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+}
 
 
 # ============================================================================
@@ -344,6 +356,184 @@ def navigate_to_signin(page, provider: str) -> bool:
     return False
 
 
+
+# ============================================================================
+# Network capture
+# ============================================================================
+
+def _redact_headers(headers: dict) -> dict:
+    """Remove session/authentication headers from persisted captures."""
+    result = {}
+
+    for key, value in (headers or {}).items():
+        if key.lower() in SENSITIVE_HEADERS:
+            result[key] = "[REDACTED]"
+        else:
+            result[key] = value
+
+    return result
+
+
+def _safe_body(text: str | None):
+    """Sanitize JSON response bodies while avoiding huge/non-JSON dumps."""
+    if text is None:
+        return None
+
+    if len(text) > 2_000_000:
+        return "[BODY OMITTED: larger than 2 MB]"
+
+    try:
+        data = json.loads(text)
+
+        def redact(value):
+            if isinstance(value, dict):
+                return {
+                    key: (
+                        "[REDACTED]"
+                        if str(key).lower() in {
+                            "password",
+                            "passwd",
+                            "access_token",
+                            "refresh_token",
+                            "id_token",
+                            "authorization",
+                            "cookie",
+                            "set-cookie",
+                            "api_key",
+                            "apikey",
+                            "secret",
+                        }
+                        else redact(item)
+                    )
+                    for key, item in value.items()
+                }
+
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+
+            return value
+
+        return redact(data)
+
+    except Exception:
+        return "[NON-JSON BODY OMITTED]"
+
+
+class NetworkCapture:
+    """Capture sanitized Playwright request/response activity."""
+
+    def __init__(self, page):
+        self.page = page
+        self.events = []
+        self.started = datetime.now(timezone.utc).isoformat()
+
+        page.on("request", self._on_request)
+        page.on("response", self._on_response)
+        page.on("requestfailed", self._on_request_failed)
+
+    def _on_request(self, request):
+        try:
+            self.events.append({
+                "type": "request",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "method": request.method,
+                "url": request.url,
+                "resource_type": request.resource_type,
+                "is_navigation": request.is_navigation(),
+                "headers": _redact_headers(request.headers),
+            })
+        except Exception as exc:
+            log.debug(f"Request capture failed: {exc}")
+
+    def _on_response(self, response):
+        try:
+            request = response.request
+
+            event = {
+                "type": "response",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": response.status,
+                "status_text": response.status_text,
+                "url": response.url,
+                "resource_type": request.resource_type,
+                "request_method": request.method,
+                "request_headers": _redact_headers(
+                    request.headers
+                ),
+                "response_headers": _redact_headers(
+                    response.headers
+                ),
+            }
+
+            try:
+                event["body"] = _safe_body(response.text())
+            except Exception as exc:
+                event["body"] = f"[BODY UNAVAILABLE: {exc}]"
+
+            self.events.append(event)
+
+        except Exception as exc:
+            log.debug(f"Response capture failed: {exc}")
+
+    def _on_request_failed(self, request):
+        try:
+            self.events.append({
+                "type": "request_failed",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "method": request.method,
+                "url": request.url,
+                "resource_type": request.resource_type,
+                "failure": request.failure,
+                "headers": _redact_headers(request.headers),
+            })
+        except Exception as exc:
+            log.debug(f"Failed-request capture failed: {exc}")
+
+    def save(self, profile_name: str):
+        NETWORK_CAPTURE_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        timestamp = datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+
+        safe_name = "".join(
+            c if c.isalnum() or c in "-_." else "_"
+            for c in profile_name
+        )
+
+        output = (
+            NETWORK_CAPTURE_DIR
+            / f"{safe_name}_set_cookie_{timestamp}.json"
+        )
+
+        payload = {
+            "capture_started": self.started,
+            "capture_finished": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "profile": profile_name,
+            "event_count": len(self.events),
+            "events": self.events,
+        }
+
+        output.write_text(
+            json.dumps(
+                payload,
+                indent=2,
+                ensure_ascii=False,
+            ) + "\n"
+        )
+
+        log.info(
+            f"Saved network capture: {output}"
+        )
+
+        return output
+
+
 # ============================================================================
 # Profile
 # ============================================================================
@@ -502,6 +692,10 @@ def try_profile(
                 # STEP 3: Click Set Cookie
                 # ----------------------------------------------------------
 
+                # Attach listeners BEFORE the click so XHR/fetch and
+                # navigation requests triggered by it are captured.
+                network_capture = NetworkCapture(page)
+
                 setcookie_success = False
 
                 for retry in range(2):
@@ -546,6 +740,16 @@ def try_profile(
                             )
 
                         log.info("Clicked: Set Cookie")
+
+                        # Allow asynchronous XHR/fetch requests triggered
+                        # by the click to finish.
+                        try:
+                            page.wait_for_timeout(5_000)
+                        except Exception:
+                            pass
+
+                        network_capture.save(profile_path.name)
+
                         setcookie_success = True
                         break
 

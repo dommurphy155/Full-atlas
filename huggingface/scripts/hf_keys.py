@@ -43,6 +43,7 @@ from config import (
     HF_TOKEN_PREFIX, HF_CONFIRMATION_URL_PREFIX, CAPTCHA_COOKIE_FILE,
     HF_BASE, setup_logging, first_run_setup, _ensure_dirs,
 )
+from db import insert_key
 
 log = setup_logging("hf_keys")
 
@@ -260,6 +261,13 @@ class HuggingFaceSignup:
             f.write(api_key + "\n")
         os.chmod(KEYS_FILE, 0o600)
         _log(f"Saved token to {KEYS_FILE}")
+
+        # Also persist to runs DB
+        try:
+            insert_key(api_key)
+            _log("Token recorded in hf_runs.db")
+        except Exception as db_exc:
+            _log(f"DB key insert warning: {db_exc}")
 
         return api_key
 
