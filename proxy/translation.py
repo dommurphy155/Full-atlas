@@ -250,6 +250,128 @@ def _is_anthropic_content_list(content: Any) -> bool:
     return False
 
 
+def _messages_have_tool_images(messages: List[Any]) -> bool:
+    """Detect Codex/OpenAI tool results containing image payloads."""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in ("input_image", "image_url", "image"):
+                return True
+
+    return False
+
+
+def _normalize_openai_tool_images(messages: List[Any]) -> List[Any]:
+    """Promote images from OpenAI/Codex tool results into user vision input."""
+    out: List[Any] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            out.append(msg)
+            continue
+
+        content = msg.get("content")
+
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+
+        text_parts: List[str] = []
+        image_parts: List[Dict[str, Any]] = []
+
+        for item in content:
+            if not isinstance(item, dict):
+                text_parts.append(_stringify_args(item))
+                continue
+
+            item_type = item.get("type")
+
+            if item_type == "input_image":
+                url = item.get("image_url", "")
+                if url:
+                    image_part: Dict[str, Any] = {
+                        "type": "image_url",
+                        "image_url": {"url": url},
+                    }
+                    if item.get("detail"):
+                        image_part["image_url"]["detail"] = item["detail"]
+                    image_parts.append(image_part)
+                continue
+
+            if item_type == "image_url":
+                image_url = item.get("image_url")
+                if isinstance(image_url, dict):
+                    url = image_url.get("url", "")
+                    if url:
+                        image_parts.append({
+                            "type": "image_url",
+                            "image_url": dict(image_url),
+                        })
+                elif isinstance(image_url, str) and image_url:
+                    image_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": image_url},
+                    })
+                continue
+
+            if item_type == "image":
+                source = item.get("source")
+                if isinstance(source, dict):
+                    source_type = source.get("type")
+
+                    if source_type == "base64":
+                        media_type = source.get("media_type", "image/jpeg")
+                        data = source.get("data", "")
+                        if data:
+                            image_parts.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{media_type};base64,{data}"
+                                },
+                            })
+                        continue
+
+                    if source_type == "url":
+                        url = source.get("url", "")
+                        if url:
+                            image_parts.append({
+                                "type": "image_url",
+                                "image_url": {"url": url},
+                            })
+                        continue
+
+            text_parts.append(_stringify_args(item))
+
+        # Preserve the tool result for the function/tool-call protocol.
+        tool_msg = dict(msg)
+
+        if text_parts:
+            tool_msg["content"] = "\n".join(text_parts)
+        elif image_parts:
+            tool_msg["content"] = "[image output attached]"
+        else:
+            tool_msg["content"] = ""
+
+        out.append(tool_msg)
+
+        # Chat Completions vision input belongs on a user message.
+        if image_parts:
+            out.append({
+                "role": "user",
+                "content": image_parts,
+            })
+
+    return out
+
+
 def _messages_look_anthropic(messages: List[Any]) -> bool:
     for msg in messages:
         if not isinstance(msg, dict):
@@ -583,91 +705,341 @@ def anthropic_messages_to_openai(
             continue
 
         if role == "user" and isinstance(content, list):
-            text_parts = []
-            tool_results: List[Dict] = []
-            image_parts: List[Dict] = []
+            text_parts: List[str] = []
+            tool_results: List[Dict[str, Any]] = []
+            image_parts: List[Dict[str, Any]] = []
             other_parts: List[Any] = []
             user_cache_controls: List[Dict[str, Any]] = []
+
+            # Images returned by tools are deliberately emitted as a separate
+            # user multimodal message. OpenAI-compatible Chat Completions
+            # providers consistently expect image_url content parts on a
+            # user message, rather than image content inside role=tool.
+            tool_image_parts: List[Dict[str, Any]] = []
+
             for block in content:
                 if not isinstance(block, dict):
                     if block is not None:
                         text_parts.append(str(block))
                     continue
+
                 btype = block.get("type")
+
                 if btype == "text":
                     text_parts.append(block.get("text", ""))
                     cc = block.get("cache_control")
                     if cc:
                         user_cache_controls.append(cc)
+
                 elif btype == "tool_result":
                     c = block.get("content", "")
+
+                    # A tool result may contain text plus multimodal output.
+                    # Keep ordinary tool output in role=tool, but move images
+                    # into a standard OpenAI-compatible user image message.
                     if isinstance(c, list):
-                        c = "\n".join(
-                            b.get("text", "") if isinstance(b, dict) else str(b)
-                            for b in c
-                        )
-                    tr = {
+                        tool_text_parts: List[str] = []
+
+                        for item in c:
+                            if not isinstance(item, dict):
+                                if item is not None:
+                                    tool_text_parts.append(str(item))
+                                continue
+
+                            item_type = item.get("type")
+
+                            if item_type == "text":
+                                text = item.get("text", "")
+                                if text:
+                                    tool_text_parts.append(str(text))
+
+                            elif item_type == "input_image":
+                                image_url = item.get("image_url", "")
+
+                                if image_url:
+                                    image_part: Dict[str, Any] = {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": image_url,
+                                        },
+                                    }
+
+                                    if item.get("detail"):
+                                        image_part["image_url"]["detail"] = item["detail"]
+
+                                    tool_image_parts.append(image_part)
+
+                            elif item_type == "image_url":
+                                # Already OpenAI-style multimodal content.
+                                image_url_obj = item.get("image_url")
+
+                                if isinstance(image_url_obj, dict):
+                                    image_url = image_url_obj.get("url", "")
+                                    if image_url:
+                                        image_part = {
+                                            "type": "image_url",
+                                            "image_url": dict(image_url_obj),
+                                        }
+                                        tool_image_parts.append(image_part)
+                                elif isinstance(image_url_obj, str) and image_url_obj:
+                                    tool_image_parts.append(
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": image_url_obj,
+                                            },
+                                        }
+                                    )
+
+                            elif item_type == "image":
+                                # Accept Anthropic-style image blocks even when
+                                # they arrive nested inside a tool result.
+                                source = item.get("source") or {}
+
+                                if source.get("type") == "base64":
+                                    data = source.get("data", "")
+                                    if data:
+                                        media_type = source.get(
+                                            "media_type",
+                                            "image/png",
+                                        )
+                                        tool_image_parts.append(
+                                            {
+                                                "type": "image_url",
+                                                "image_url": {
+                                                    "url": (
+                                                        f"data:{media_type};"
+                                                        f"base64,{data}"
+                                                    ),
+                                                },
+                                            }
+                                        )
+
+                                elif source.get("type") == "url":
+                                    url = source.get("url", "")
+                                    if url:
+                                        tool_image_parts.append(
+                                            {
+                                                "type": "image_url",
+                                                "image_url": {
+                                                    "url": url,
+                                                },
+                                            }
+                                        )
+
+                            else:
+                                # Preserve unknown tool-result blocks as text
+                                # instead of silently dropping them.
+                                tool_text_parts.append(_stringify_args(item))
+
+                        if tool_text_parts:
+                            c = "\n".join(tool_text_parts)
+                        else:
+                            # The image itself is emitted separately below.
+                            # Do not send an invalid image-bearing role=tool
+                            # content array upstream.
+                            c = "[image output attached]" if tool_image_parts else ""
+
+                    elif isinstance(c, dict):
+                        # Be tolerant of a single non-list multimodal block.
+                        item_type = c.get("type")
+
+                        if item_type == "input_image":
+                            image_url = c.get("image_url", "")
+                            if image_url:
+                                image_part = {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": image_url,
+                                    },
+                                }
+                                if c.get("detail"):
+                                    image_part["image_url"]["detail"] = c["detail"]
+                                tool_image_parts.append(image_part)
+                            c = "[image output attached]"
+
+                        elif item_type == "image_url":
+                            image_url_obj = c.get("image_url")
+                            if isinstance(image_url_obj, dict):
+                                url = image_url_obj.get("url", "")
+                                if url:
+                                    tool_image_parts.append(
+                                        {
+                                            "type": "image_url",
+                                            "image_url": dict(image_url_obj),
+                                        }
+                                    )
+                            elif isinstance(image_url_obj, str) and image_url_obj:
+                                tool_image_parts.append(
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": image_url_obj,
+                                        },
+                                    }
+                                )
+                            c = "[image output attached]"
+
+                        else:
+                            c = _stringify_args(c)
+
+                    elif not isinstance(c, str):
+                        c = _stringify_args(c)
+
+                    tr: Dict[str, Any] = {
                         "role": "tool",
-                        "tool_call_id": block.get("tool_use_id")
-                        or block.get("id")
-                        or "",
-                        "content": _stringify_args(c)
-                        if not isinstance(c, str)
-                        else c,
+                        "tool_call_id": (
+                            block.get("tool_use_id")
+                            or block.get("id")
+                            or ""
+                        ),
+                        "content": c,
                     }
+
                     if block.get("is_error"):
-                        tr["content"] = f"[error] {tr['content']}"
+                        if isinstance(tr["content"], str):
+                            tr["content"] = f"[error] {tr['content']}"
+
                     if "cache_control" in block:
                         tr["_anthropic_cache_control"] = block["cache_control"]
+
                     tool_results.append(tr)
+
                 elif btype == "image":
                     src = block.get("source") or {}
+
                     if src.get("type") == "base64":
+                        data = src.get("data", "")
+                        if data:
+                            image_parts.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": (
+                                            f"data:{src.get('media_type', 'image/png')}"
+                                            f";base64,{data}"
+                                        ),
+                                    },
+                                }
+                            )
+
+                    elif src.get("type") == "url":
+                        url = src.get("url", "")
+                        if url:
+                            image_parts.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": url,
+                                    },
+                                }
+                            )
+
+                elif btype == "input_image":
+                    # Responses/OpenAI-style image input appearing directly
+                    # inside a user content array.
+                    image_url = block.get("image_url", "")
+
+                    if image_url:
+                        image_part = {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_url,
+                            },
+                        }
+
+                        if block.get("detail"):
+                            image_part["image_url"]["detail"] = block["detail"]
+
+                        image_parts.append(image_part)
+
+                elif btype == "image_url":
+                    # Already-normalized OpenAI image content.
+                    image_url_obj = block.get("image_url")
+
+                    if isinstance(image_url_obj, dict):
+                        if image_url_obj.get("url"):
+                            image_parts.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": dict(image_url_obj),
+                                }
+                            )
+                    elif isinstance(image_url_obj, str) and image_url_obj:
                         image_parts.append(
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": (
-                                        f"data:{src.get('media_type', 'image/png')}"
-                                        f";base64,{src.get('data', '')}"
-                                    ),
+                                    "url": image_url_obj,
                                 },
                             }
                         )
-                    elif src.get("type") == "url":
-                        image_parts.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": src.get("url", "")},
-                            }
-                        )
+
                 else:
-                    # Preserve unknown blocks as text fallback
+                    # Preserve unknown blocks as text fallback.
                     other_parts.append(block)
+
+            # Tool results must remain in the tool role so normal function
+            # calling continues to work.
             for tr in tool_results:
                 out.append(tr)
+
+            # Images produced by tools are exposed as actual multimodal model
+            # input. This is the provider-neutral OpenAI-compatible form used
+            # by OpenRouter, Hugging Face, NVIDIA NIM, Together, etc.
+            if tool_image_parts:
+                tool_image_msg: Dict[str, Any] = {
+                    "role": "user",
+                    "content": tool_image_parts,
+                }
+                out.append(tool_image_msg)
+
             if text_parts or image_parts or other_parts:
                 if image_parts or other_parts:
                     content_list: List[Any] = [
-                        {"type": "text", "text": t} for t in text_parts
+                        {"type": "text", "text": t}
+                        for t in text_parts
                     ] + image_parts
-                    # Attach unknown blocks as text so they are not silently lost
+
                     for ob in other_parts:
-                        if isinstance(ob, dict) and ob.get("type") == "text":
+                        if (
+                            isinstance(ob, dict)
+                            and ob.get("type") == "text"
+                        ):
                             content_list.append(ob)
                         else:
                             content_list.append(
-                                {"type": "text", "text": _stringify_args(ob)}
+                                {
+                                    "type": "text",
+                                    "text": _stringify_args(ob),
+                                }
                             )
-                    user_msg: Dict[str, Any] = {"role": "user", "content": content_list}
+
+                    user_msg: Dict[str, Any] = {
+                        "role": "user",
+                        "content": content_list,
+                    }
+
                     if user_cache_controls:
-                        user_msg["_anthropic_cache_control"] = user_cache_controls
+                        user_msg["_anthropic_cache_control"] = (
+                            user_cache_controls
+                        )
+
                     out.append(user_msg)
+
                 else:
-                    user_msg2: Dict[str, Any] = {"role": "user", "content": "\n".join(text_parts)}
+                    user_msg2: Dict[str, Any] = {
+                        "role": "user",
+                        "content": "\n".join(text_parts),
+                    }
+
                     if user_cache_controls:
-                        user_msg2["_anthropic_cache_control"] = user_cache_controls
+                        user_msg2["_anthropic_cache_control"] = (
+                            user_cache_controls
+                        )
+
                     out.append(user_msg2)
+
             continue
 
         # Fallback: flatten list content to string
@@ -1378,7 +1750,12 @@ def prepare_chat_body(body: Dict[str, Any]) -> Dict[str, Any]:
         if _messages_look_anthropic(msgs):
             system = body.pop("system", None)
             body["messages"] = anthropic_messages_to_openai(msgs, system)
-        # else: leave pure OpenAI messages alone
+
+        # Codex/OpenAI tool results can contain input_image blocks. These are
+        # already OpenAI-shaped messages otherwise, but the image must be
+        # promoted into a user multimodal message for Chat Completions.
+        elif _messages_have_tool_images(msgs):
+            body["messages"] = _normalize_openai_tool_images(msgs)
 
     # ----- stop -----
     if "stop_sequences" in body and "stop" not in body:
@@ -1626,10 +2003,17 @@ def openai_response_to_anthropic(data: Dict[str, Any], *, rid: str = "") -> Dict
 
 def openai_sse_to_anthropic_sse(
     sse_chunk: Dict[str, Any],
+    state: Optional[Dict[str, Any]] = None,
 ) -> List[Tuple[str, Optional[Dict]]]:
     """Convert a single OpenAI SSE payload into Anthropic SSE events."""
 
     out: List[Tuple[str, Optional[Dict]]] = []
+
+    if state is None:
+        state = {
+            "thinking_started": False,
+            "tool_blocks": {},
+        }
 
     choices = sse_chunk.get("choices") or []
     if not choices:
@@ -1654,9 +2038,22 @@ def openai_sse_to_anthropic_sse(
     # --- reasoning / thinking ---
     reasoning = delta.get("reasoning_content")
     if isinstance(reasoning, str) and reasoning:
+        # Index 0 is reserved for the text block. Thinking gets its own
+        # block at index 1, opened only once for the lifetime of the stream.
+        if not state["thinking_started"]:
+            out.append(("content_block_start", {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": "",
+                },
+            }))
+            state["thinking_started"] = True
+
         out.append(("content_block_delta", {
             "type": "content_block_delta",
-            "index": 0,
+            "index": 1,
             "delta": {
                 "type": "thinking_delta",
                 "thinking": reasoning,
@@ -1673,52 +2070,68 @@ def openai_sse_to_anthropic_sse(
         idx = tc.get("index", 0)
         anthropic_idx = idx + 1
         fn = tc.get("function") or {}
+        name = fn.get("name")
+        arguments = fn.get("arguments")
 
-        if fn.get("name"):
+        if arguments and not isinstance(arguments, str):
+            import json
+            arguments = json.dumps(arguments)
+
+        block = state["tool_blocks"].get(idx)
+
+        # A tool block is opened once and remains open across all SSE chunks.
+        if name and block is None:
+            block = {
+                "anthropic_idx": anthropic_idx,
+                "started": True,
+            }
+            state["tool_blocks"][idx] = block
+
             out.append(("content_block_start", {
                 "type": "content_block_start",
                 "index": anthropic_idx,
                 "content_block": {
                     "type": "tool_use",
                     "id": tc.get("id") or "",
-                    "name": fn["name"],
+                    "name": name,
                     "input": {},
                 },
             }))
 
-        arguments = fn.get("arguments")
-        if arguments:
-            if not isinstance(arguments, str):
-                import json
-                arguments = json.dumps(arguments)
-
+        if arguments and block is not None:
             out.append(("content_block_delta", {
                 "type": "content_block_delta",
-                "index": anthropic_idx,
+                "index": block["anthropic_idx"],
                 "delta": {
                     "type": "input_json_delta",
                     "partial_json": arguments,
                 },
             }))
 
-        if fn.get("name") or arguments:
-            out.append(("content_block_stop", {
-                "type": "content_block_stop",
-                "index": anthropic_idx,
-            }))
-
     # --- finish ---
     if finish_reason:
+        # Close thinking exactly once.
+        if state["thinking_started"]:
+            out.append(("content_block_stop", {
+                "type": "content_block_stop",
+                "index": 1,
+            }))
+            state["thinking_started"] = False
+
+        # Close every tool block exactly once.
+        for block in state["tool_blocks"].values():
+            out.append(("content_block_stop", {
+                "type": "content_block_stop",
+                "index": block["anthropic_idx"],
+            }))
+        state["tool_blocks"].clear()
+
         out.append(("message_delta", {
             "type": "message_delta",
             "delta": {
                 "stop_reason":
                     _map_openai_finish_reason_to_anthropic(finish_reason),
             },
-        }))
-
-        out.append(("message_stop", {
-            "type": "message_stop",
         }))
     return out
 

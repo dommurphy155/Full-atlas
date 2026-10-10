@@ -1,0 +1,9 @@
+HF AUTOMATION STATUS — 2026-10-03 08:32 BST
+Service: active | Since: 2026-10-03 02:20:16 | Mem: 1.8G (peak 2.0G)
+Post-fix runs: 41 SUCCESS / 8 FAILED
+Cumulative: success=41 fail=10
+Errors: 
+  2026-10-03 02:26:34,126 - main - INFO - ERROR during signup: Field 'email' not found (selectors: input[name="email"], input[type="email"])
+  2026-10-03 04:02:04,623 - main - INFO - ERROR during signup: Field 'email' not found (selectors: input[name="email"], input[type="email"])
+  2026-10-03 04:03:11,346 - main - INFO - ERROR during signup: Field 'email' not found (selectors: input[name="email"], input[type="email"])
+Health: DEGRADED

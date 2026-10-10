@@ -1,0 +1,6 @@
+HF AUTOMATION STATUS — 2026-10-03 02:29 BST
+Service: active (running) | Uptime: 9min since restart
+Runs this window: 2 SUCCESS / 0 FAILED (100% success)
+Cumulative: success=2 fail=0 (100%)
+Errors: 1 transient (HF join page slow load, email field timeout — retried & passed)
+Health: OK

@@ -90,7 +90,7 @@ TARGET_COOKIE_NAME = "hc_accessibility"
 TARGET_URL = "https://dashboard.hcaptcha.com/login"
 SUCCESS_TEXT = "Set Cookie"
 LIMIT_TEXT = "daily limit"
-DISPLAY_NUM = ":99"
+DISPLAY_NUM = ":1"
 TIMEOUT_MS = 15000
 PAGE_LOAD_TIMEOUT_MS = 60000
 
@@ -100,7 +100,7 @@ def setup_logging(name: str) -> logging.Logger:
     import logging as _logging
     logger = _logging.getLogger(name)
     logger.setLevel(_logging.INFO)
-    fmt = _logging.Formatter("%(asctime)s %(message)s", datefmt="%m-%d %H:%M:%S")
+    fmt = _logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     fh = _logging.FileHandler(str(DATA_DIR / "orchestrator.log"))
     fh.setFormatter(fmt)
     sh = _logging.StreamHandler(_sys.stdout)

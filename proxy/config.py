@@ -128,7 +128,7 @@ OPENROUTER_CONFIG = ProviderConfig(
     name="openrouter",
     base_url=OPENROUTER_BASE_URL,
     key_prefix="sk-",
-    default_model=_env("ATLAS_OPENROUTER_MODEL", _env("OPENROUTER_MODEL", "z-ai/glm-5.2:free")),
+    default_model=_env("ATLAS_OPENROUTER_MODEL", _env("OPENROUTER_MODEL", "1. Qwen/Qwen-Image-2512")),
     key_file=KEY_FILE,
     dead_keys_file=FALLBACK_KEY_FILE,
     key_label="OpenRouter",
@@ -208,7 +208,7 @@ def _load_or_default_model() -> str:
     model = _load_runtime_model()
     if model:
         return model
-    return _env("ATLAS_OPENROUTER_MODEL", _env("OPENROUTER_MODEL", "z-ai/glm-5.2:free"))
+    return _env("ATLAS_OPENROUTER_MODEL", _env("OPENROUTER_MODEL", "1. Qwen/Qwen-Image-2512"))
 
 
 OPENROUTER_MODEL: str = _load_or_default_model()
@@ -479,7 +479,7 @@ CORS_ORIGINS: List[str] = [
 # ---------------------------------------------------------------------------
 UPSTREAM_REFERER: str = _env("ATLAS_UPSTREAM_REFERER", "https://localhost:8788")
 UPSTREAM_TITLE: str = _env("ATLAS_UPSTREAM_TITLE", "Atlas-Translation-Proxy")
-SAVE_PAYLOAD_FILES: bool = _env_bool("ATLAS_SAVE_PAYLOAD_FILES", False)
+SAVE_PAYLOAD_FILES: bool = _env_bool("ATLAS_SAVE_PAYLOAD_FILES", True)
 """If True, write incoming request payloads to PAYLOAD_DIR for debugging."""
 PAYLOAD_DIR: str = _env("ATLAS_PAYLOAD_DIR", "/tmp/atlas_payloads")
 

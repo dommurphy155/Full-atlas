@@ -1,0 +1,9 @@
+HF AUTOMATION STATUS — 2026-10-04 08:41 BST
+Service: active | Since: 2026-10-03 22:47:47 | Mem: 1.8G (peak 2.0G)
+Post-fix runs: 0 SUCCESS / 15 FAILED
+Cumulative: success=0 fail=43
+Errors: 
+  2026-10-04 02:57:33,268 - main - INFO - ERROR during signup: Page.wait_for_selector: Timeout 10000ms exceeded.
+  2026-10-04 05:02:16,772 - main - INFO - ERROR during signup: Field 'email' not found (selectors: input[name="email"], input[type="email"])
+  2026-10-04 05:43:35,018 - main - INFO - ERROR during signup: Page.wait_for_selector: Timeout 10000ms exceeded.
+Health: DEGRADED

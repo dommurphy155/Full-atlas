@@ -1,0 +1,18 @@
+HF AUTOMATION STATUS — 2026-10-03 02:29 BST
+Service: active | Since: 2026-10-03 02:20:16 BST | Mem: 97M (peak 964M)
+Runs this window: 4 SUCCESS / 50 FAILED
+Cumulative: success=2 fail=0
+Errors: 
+  Traceback (most recent call last):
+    File "/root/atlas/huggingface/scripts/main.py", line 976, in main
+      api_key = await run_full_signup(email, PASSWORD)
+  --
+  2026-10-03 02:26:34,126 - main - INFO - ERROR during signup: Field 'email' not found (selectors: input[name="email"], input[type="email"])
+  Traceback (most recent call last):
+    File "/root/atlas/huggingface/scripts/main.py", line 549, in _fill_and_verify
+      await page.wait_for_selector(selector_alt, timeout=timeout)
+  --
+  Traceback (most recent call last):
+    File "/root/atlas/huggingface/scripts/main.py", line 973, in main
+      api_key = await run_full_signup(email, PASSWORD)
+Health: DEGRADED

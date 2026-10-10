@@ -10,10 +10,6 @@ The scheduler itself NEVER launches browsers — it just spawns main.py
 as a subprocess.  Each main.py invocation handles its own CDP launch,
 cookie injection, signup, token extraction, and full cleanup.
 
-All run data is persisted to SQLite (hf_runs.db) — survives sessions.
-The (success=N fail=M) status line is always read from the DB, not
-from in-memory counters.
-
 Usage:
     python3 hf_scheduler.py --runs 5               # 5 runs, 240s delay
     python3 hf_scheduler.py --runs 10 --delay 30   # 10 runs, 30s delay
@@ -23,7 +19,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
 import time
@@ -33,64 +28,33 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCRIPT = SCRIPT_DIR / "main.py"
 
-sys.path.insert(0, str(SCRIPT_DIR))
-from db import init_db, start_session, end_session, start_attempt, end_attempt
-from db import _get_conn
-
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def session_tally(session_id: int) -> tuple[int, int]:
-    """Return (successes, failures) for *session_id* — always from the DB."""
-    conn = _get_conn()
-    cur = conn.execute(
-        "SELECT status, COUNT(*) FROM attempts WHERE session_id = ? GROUP BY status",
-        (session_id,),
-    )
-    rows = {row[0]: row[1] for row in cur.fetchall()}
-    return rows.get("success", 0), rows.get("fail", 0) + rows.get("timeout", 0) + rows.get("error", 0)
-
-
-def run_once(attempt_num: int, session_id: int, attempt_id: int) -> dict:
-    """Run main.py once. Returns dict with status, exit_code, error, duration_seconds."""
-    log(f"=== Run #{attempt_num} starting ===")
-    started = time.time()
-    status = "fail"
-    exit_code = -1
-    error = None
-
+def run_once(attempt: int) -> bool:
+    """Run main.py once.  Returns True on success (exit 0)."""
+    log(f"=== Run #{attempt} starting ===")
     try:
         result = subprocess.run(
             [sys.executable, str(SCRIPT)],
             timeout=600,  # 10 min max per run
-            env={
-                **os.environ,
-                "HF_SESSION_ID": str(session_id),
-                "HF_ATTEMPT_ID": str(attempt_id),
-            },
         )
-        exit_code = result.returncode
         if result.returncode == 0:
-            log(f"Run #{attempt_num} SUCCESS")
-            status = "success"
+            log(f"Run #{attempt} SUCCESS")
+            return True
         else:
-            log(f"Run #{attempt_num} FAILED (exit code {result.returncode})")
-            status = "fail"
+            log(f"Run #{attempt} FAILED (exit code {result.returncode})")
+            return False
     except subprocess.TimeoutExpired:
-        log(f"Run #{attempt_num} TIMED OUT after 10 minutes")
-        status = "timeout"
-        error = "Timeout after 600s"
+        log(f"Run #{attempt} TIMED OUT after 10 minutes")
+        return False
     except KeyboardInterrupt:
         raise
     except Exception as e:
-        log(f"Run #{attempt_num} ERROR: {e}")
-        status = "error"
-        error = str(e)[:500]
-
-    duration = time.time() - started
-    return {"status": status, "exit_code": exit_code, "error": error, "duration_seconds": duration}
+        log(f"Run #{attempt} ERROR: {e}")
+        return False
 
 
 def main() -> None:
@@ -105,51 +69,32 @@ def main() -> None:
     total = args.runs
     delay = args.delay
 
-    # --- DB init ---
-    init_db()
-    session_id = start_session()
-
     log(f"Scheduler started — {'∞' if forever else total} run(s), {delay}s delay between each")
-    log(f"Session ID: {session_id}")
     log("Press Ctrl+C to stop\n")
 
-    attempt_num = 1
+    successes = 0
+    failures = 0
+    attempt = 1
 
     try:
-        while forever or attempt_num <= total:
-            # Record attempt start
-            attempt_id = start_attempt(session_id, attempt_num)
+        while forever or attempt <= total:
+            success = run_once(attempt)
+            if success:
+                successes += 1
+            else:
+                failures += 1
 
-            result = run_once(attempt_num, session_id, attempt_id)
-
-            # Record attempt end
-            end_attempt(
-                attempt_id,
-                status=result["status"],
-                exit_code=result["exit_code"],
-                error_message=result["error"],
-                duration_seconds=result["duration_seconds"],
-            )
-
-            attempt_num += 1
-            if not (forever or attempt_num <= total):
+            attempt += 1
+            if not (forever or attempt <= total):
                 break
 
-            # Pull live tally from DB — not in-memory counters
-            s, f = session_tally(session_id)
-            log(f"Waiting {delay}s before next run... (success={s} fail={f})\n")
+            log(f"Waiting {delay}s before next run... (success={successes} fail={failures})\n")
             time.sleep(delay)
 
     except KeyboardInterrupt:
         log("\nScheduler stopped by user")
-        end_session(session_id, 0, 0, status="interrupted")
-        s, f = session_tally(session_id)
-        log(f"\n=== DONE: {s} succeeded, {f} failed out of {attempt_num - 1} runs ===")
-        return
 
-    s, f = session_tally(session_id)
-    end_session(session_id, s, f, status="completed")
-    log(f"\n=== DONE: {s} succeeded, {f} failed out of {attempt_num - 1} runs ===")
+    log(f"\n=== DONE: {successes} succeeded, {failures} failed out of {attempt - 1} runs ===")
 
 
 if __name__ == "__main__":

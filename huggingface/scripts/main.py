@@ -3,7 +3,7 @@
 Main orchestrator for HuggingFace signup automation.
 
 Flow:
-  1. Launch Camoufox stealth browser (fresh fingerprint every run)
+  1. Launch CDP via launch_cdp.sh (random port, connects to display:1)
   2. Inject hCaptcha cookie if valid cookie exists in captcha_cookie.json
      — if not, run get_cookie.py to obtain a fresh cookie first
   3. Burn all existing AgentMail inboxes and create a fresh email
@@ -22,46 +22,52 @@ Usage:
     python3 main.py
 """
 import asyncio
+import atexit
 import json
 import logging
 import os
 import random
 import re
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import (
     ROOT_DIR, DATA_DIR, KEYS_FILE, AGENTMAIL_SCRIPT, GET_COOKIE_SCRIPT,
+    LAUNCH_CDP_SCRIPT, HF_KEYS_SCRIPT, CDP_HOST, CDP_PORT_FILE, CDP_PID_FILE, CDP_TIMEOUT,
     CAPTCHA_COOKIE_FILE, PASSWORD, HF_JOIN_URL, HF_TOKEN_PREFIX,
     HF_CONFIRMATION_URL_PREFIX, EMAIL_POLL_TIMEOUT, EMAIL_POLL_INTERVAL,
+    cleanup_stale_cdp_profiles, _kill_chrome_on_cdp_port,
     bootstrap,
     is_py_module_available,
     install_py_module,
     is_camoufox_browser_installed,
     ensure_camoufox_browsers,
+    is_patchright_browser_installed,
+    ensure_playwright_browsers,
 )
-from db import insert_key
 
-# --- Camoufox dependency check ---
-if not is_py_module_available("camoufox"):
-    print("  [SETUP] Installing camoufox ...", file=sys.stderr)
-    install_py_module("camoufox")
-if not is_camoufox_browser_installed():
-    print("  [SETUP] Downloading camoufox browser binaries ...", file=sys.stderr)
-    ensure_camoufox_browsers()
+# --- patchright / playwright dependency check (system-wide via importlib) ---
+if not is_py_module_available("patchright"):
+    print("  [SETUP] Installing patchright ...", file=sys.stderr)
+    install_py_module("patchright")
+if not is_patchright_browser_installed():
+    print("  [SETUP] Downloading patchright/chromium browsers ...", file=sys.stderr)
+    ensure_playwright_browsers()
 
-from camoufox.async_api import AsyncCamoufox
+from patchright.async_api import async_playwright
 
 # Setup logging — flush immediately for real-time output
 import sys as _sys
 
 _logger = logging.getLogger("main")
 _logger.setLevel(logging.INFO)
-_fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%m-%d %H:%M:%S")
+_fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 _fh = logging.FileHandler(str(DATA_DIR / "orchestrator.log"))
 _fh.setFormatter(_fmt)
 _sh = logging.StreamHandler(_sys.stdout)
@@ -72,10 +78,104 @@ _logger.propagate = False
 logger = _logger
 
 
+# --- Global cleanup state --- #
+_active_cdp_procs: list = []
+_active_pw: list = []
+
+
+def _force_kill_cdp(port: int):
+    """Kill Chrome processes associated with a CDP port."""
+    import shutil as _shutil
+    for cmd in [
+        ["pkill", "-f", f"remote-debugging-port={port}"],
+        ["fuser", "-k", f"{port}/tcp"],
+    ]:
+        try:
+            _shutil.which(cmd[0]) and subprocess.run(cmd, capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+
+def cleanup_all():
+    """Kill all active CDP processes, Playwright instances, and temp profiles."""
+    # Kill CDP subprocesses by process group
+    for proc in _active_cdp_procs:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    # Kill by port as fallback
+    for port in CDP_PORTS:
+        _force_kill_cdp(port)
+
+    # Clean temp profile dirs
+    import glob
+    for pattern in ("/tmp/cdp_browser_profile_*", "/tmp/hf_profile_*"):
+        for d in glob.glob(pattern):
+            try:
+                import shutil
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+
+    _active_cdp_procs.clear()
+
+
+CDP_PORTS: list = []
+
+
 def log(msg: str):
     logger.info(msg)
 
 
+atexit.register(cleanup_all)
+
+# Ensure SIGINT also triggers clean exit
+def _handle_sigint(signum, frame):
+    log("Interrupted — exiting.")
+    cleanup_all()
+    sys.exit(130)
+
+signal.signal(signal.SIGINT, _handle_sigint)
+
+
+def _ensure_camoufox() -> bool:
+    """Ensure camoufox is importable AND browser binaries are present
+    (checked system-wide, not just local/venv)."""
+    if not is_py_module_available("camoufox"):
+        print("  [SETUP] Installing camoufox ...", file=sys.stderr)
+        install_py_module("camoufox")
+    if is_py_module_available("camoufox") and not is_camoufox_browser_installed():
+        print("  [SETUP] Downloading camoufox browsers ...", file=sys.stderr)
+        ensure_camoufox_browsers()
+    return is_py_module_available("camoufox") and is_camoufox_browser_installed()
+
+
+def find_free_port() -> int:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
+
+
+def wait_for_cdp(port: int, timeout: int = CDP_TIMEOUT) -> bool:
+    import urllib.request
+    cdp_url = f"http://{CDP_HOST}:{port}/json/version"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(cdp_url, timeout=3) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
 
 
 def load_captcha_cookie() -> Optional[list]:
@@ -95,7 +195,7 @@ def load_captcha_cookie() -> Optional[list]:
                 c.get("name") == "hc_accessibility" for c in cookies
             )
             if not has_correct_cookie:
-                log(
+                log.warning(
                     "Cookie file does not contain 'hc_accessibility' — "
                     "re-running get_cookie.py to obtain fresh cookie"
                 )
@@ -109,7 +209,7 @@ def load_captcha_cookie() -> Optional[list]:
                     timeout=300,
                 )
                 if result.returncode != 0:
-                    log(f"get_cookie.py failed: {result.stderr}")
+                    log.error(f"get_cookie.py failed: {result.stderr}")
                     return None
                 # Reload the cookie file
                 data = json.loads(CAPTCHA_COOKIE_FILE.read_text())
@@ -120,7 +220,7 @@ def load_captcha_cookie() -> Optional[list]:
 
         return cookies if cookies else None
     except Exception as e:
-        log(f"Failed to load captcha cookie: {e}")
+        log.error(f"Failed to load captcha cookie: {e}")
         return None
 
 
@@ -146,11 +246,17 @@ async def inject_cookie(page, cookie: dict):
         "sameSite": cookie.get("sameSite", "Lax"),
     }
 
-    # Never pass expires — Playwright silently drops expired cookies.
-    # The cookie is still valid server-side; session cookie is fine for our flow.
+    expiry = cookie.get("expires")
+    if expiry and expiry > 0:
+        cookie_dict["expires"] = expiry
 
     cookie_host = domain.lstrip(".")
     target_url = f"https://{cookie_host}/"
+
+    log(
+        f"Cookie target: name={name!r} "
+        f"domain={domain!r} path={path!r}"
+    )
 
     # Navigate to the supplied cookie's domain first.
     try:
@@ -159,16 +265,27 @@ async def inject_cookie(page, cookie: dict):
             wait_until="domcontentloaded",
             timeout=15000,
         )
-    except Exception:
-        pass  # non-fatal — cookie injection can still succeed
+    except Exception as exc:
+        log(f"Cookie-domain navigation warning: {exc}")
 
+    # Inject ONLY the cookie supplied by the caller.
+    log(
+        f"Injecting cookie: name={name!r} "
+        f"domain={domain!r} path={path!r}"
+    )
     await page.context.add_cookies([cookie_dict])
 
-    # Verify the cookie landed in the browser jar.
+    # Immediately inspect the browser cookie jar.
     browser_cookies = await page.context.cookies()
 
+    # DEBUG: dump all cookies to see what Playwright actually returns
+    log(f"DEBUG: {len(browser_cookies)} cookies in jar after add_cookies:")
+    for c in browser_cookies:
+        log(f"  DEBUG cookie: name={c.get('name')!r} domain={c.get('domain')!r} path={c.get('path')!r} expires={c.get('expires')!r}")
+
     # Playwright normalizes cookie domains: a leading dot (.hcaptcha.com)
-    # is stored/returned as the bare domain (hcaptcha.com). Normalize both.
+    # is stored/returned as the bare domain (hcaptcha.com). Normalize both
+    # sides so the match succeeds regardless of how the cookie was supplied.
     matches = [
         c for c in browser_cookies
         if c.get("name") == name
@@ -177,22 +294,45 @@ async def inject_cookie(page, cookie: dict):
     ]
 
     if not matches:
-        # Fallback: try raw domain match
-        matches = [
+        # Fallback: try matching with raw domain (in case normalization differs)
+        matches_raw = [
             c for c in browser_cookies
             if c.get("name") == name and c.get("domain", "") == domain
         ]
+        log(f"DEBUG: normalized match failed, raw match count={len(matches_raw)}")
+        if matches_raw:
+            log(f"DEBUG: raw match domain={matches_raw[0].get('domain')!r}")
+            matches = matches_raw
 
     if not matches:
-        reason = "not found in browser jar"
-        log(f"Failed to inject cookie: {name!r} — {reason}")
+        log(
+            f"COOKIE VERIFICATION FAILED: "
+            f"name={name!r} domain={domain!r} path={path!r}"
+        )
+
+        log("Browser cookies currently present:")
+        for c in browser_cookies:
+            log(
+                f"  name={c.get('name')!r} "
+                f"domain={c.get('domain')!r} "
+                f"path={c.get('path', '/')!r}"
+            )
+
         raise RuntimeError(
             f"Cookie did not appear in browser jar: "
             f"{name!r} {domain!r} {path!r}"
         )
 
-    log(f"Injected cookie: {name!r}")
-    return matches[0]
+    landed = matches[0]
+
+    log(
+        f"COOKIE VERIFIED: "
+        f"name={landed.get('name')!r} "
+        f"domain={landed.get('domain')!r} "
+        f"path={landed.get('path', '/')!r}"
+    )
+
+    return landed
 
 
 
@@ -230,6 +370,87 @@ def run_get_cookie() -> bool:
         return False
 
 
+async def _verify_cookies_injected(page, cookies: list) -> bool:
+    """Verify all supplied cookies are present in the browser jar
+    with correct name + domain + path. Domain must match after
+    stripping a leading dot (browser normalizes '.hcaptcha.com' → 'hcaptcha.com').
+    """
+    browser_cookies = await page.context.cookies()
+    for cookie in cookies:
+        name = cookie.get("name")
+        domain = cookie.get("domain", "").lstrip(".")
+        path = cookie.get("path", "/")
+        found = any(
+            c.get("name") == name
+            and c.get("domain", "").lstrip(".") == domain
+            and c.get("path", "/") == path
+            for c in browser_cookies
+        )
+        if not found:
+            log(f"Cookie verification failed: {name} @ {domain}{path}")
+            return False
+    return True
+
+
+async def launch_cdp_and_fill_cookie(profile_suffix: str = "") -> tuple:
+    """Launch CDP and optionally use a unique /tmp profile to avoid Google
+    profile tracking across multiple signups."""
+    port = find_free_port()
+    CDP_PORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CDP_PORT_FILE.write_text(str(port), encoding="utf-8")
+    os.chmod(CDP_PORT_FILE, 0o600)
+
+    env = {**os.environ, "DISPLAY": ":1", "CDP_PORT": str(port)}
+    if profile_suffix:
+        env["HF_PROFILE_SUFFIX"] = profile_suffix
+
+    cdp_proc = subprocess.Popen(
+        ["bash", str(LAUNCH_CDP_SCRIPT)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        start_new_session=True,
+    )
+
+    CDP_PORTS.append(port)
+    _active_cdp_procs.append(cdp_proc)
+
+    if not wait_for_cdp(port, timeout=CDP_TIMEOUT):
+        try:
+            os.killpg(os.getpgid(cdp_proc.pid), signal.SIGKILL)
+        except Exception:
+            cdp_proc.kill()
+        raise RuntimeError("CDP did not become ready")
+
+    pw = await async_playwright().start()
+    browser = await pw.chromium.connect_over_cdp(f"http://{CDP_HOST}:{port}")
+    context = browser.contexts[0] if browser.contexts else await browser.new_context()
+    page = context.pages[0] if context.pages else await context.new_page()
+
+    cookies = load_captcha_cookie()
+    if cookies:
+        # Always navigate to hCaptcha first so cookie injection succeeds
+        try:
+            await page.goto("https://www.hcaptcha.com", wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        injected = []
+        failed = []
+        for cookie in cookies:
+            try:
+                await inject_cookie(page, cookie)
+                injected.append(cookie.get("name"))
+            except Exception as e:
+                failed.append(f"{cookie.get('name')}: {e}")
+        ok = await _verify_cookies_injected(page, cookies)
+        if injected and ok:
+            log(f"Injected cookie: {', '.join(injected)}")
+        else:
+            log(f"Failed to inject cookie: {'; '.join(failed) if failed else 'verification failed'}")
+    else:
+        log("No valid captcha cookie found")
+
+    return pw, browser, context, page, port, cdp_proc
 
 
 def _validate_email(email: str) -> None:
@@ -330,14 +551,6 @@ async def _fill_and_verify(page, selector: str, selector_alt: str, value: str, f
             await page.wait_for_selector(selector_alt, timeout=timeout)
             locator = page.locator(selector_alt).first
         except Exception:
-            # DEBUG: dump page state to diagnose selector mismatch
-            url = page.url
-            title = await page.title()
-            body = await page.inner_text("body") if await page.locator("body").count() else ""
-            body_preview = body[:500] if body else "(empty body)"
-            log(f"DEBUG: url={url}")
-            log(f"DEBUG: title={title}")
-            log(f"DEBUG: body preview: {body_preview}")
             raise Exception(f"Field '{field_name}' not found (selectors: {selector}, {selector_alt})")
 
     if locator:
@@ -396,43 +609,10 @@ async def _click_and_verify(page, selector_text: str, log_label: str, expected_u
 
 
 async def run_full_signup(email: str, password: str) -> Optional[str]:
-    # Randomize OS fingerprint every launch
-    chosen_os = random.choice(["windows", "macos", "linux"])
+    profile_suffix = f"signup_{int(time.time() * 1000) % 100000}"
+    pw, browser, context, page, port, cdp_proc = await launch_cdp_and_fill_cookie(profile_suffix)
 
-    # Use the same display approach as get_cookie.py — headless=False
-    # on the shared Xvfb display, so the browser renders visibly
-    os.environ["DISPLAY"] = ":99"
-
-    async with AsyncCamoufox(
-        headless=False,
-        os=chosen_os,
-        humanize=True,
-        block_webrtc=True,
-        geoip=True,
-        disable_coop=True,
-        i_know_what_im_doing=True,
-    ) as browser:
-        page = await browser.new_page()
-
-        # Inject hCaptcha cookie if available
-        cookies = load_captcha_cookie()
-        if cookies:
-            try:
-                await page.goto(
-                    "https://www.hcaptcha.com",
-                    wait_until="domcontentloaded",
-                    timeout=15000,
-                )
-            except Exception:
-                pass
-            for cookie in cookies:
-                try:
-                    await inject_cookie(page, cookie)
-                except Exception:
-                    pass
-        else:
-            log("No valid captcha cookie found")
-
+    try:
         # Navigate to join page
         log("Navigating to https://huggingface.co/join ...")
         await page.goto(HF_JOIN_URL, wait_until="domcontentloaded", timeout=60000)
@@ -557,7 +737,7 @@ async def run_full_signup(email: str, password: str) -> Optional[str]:
 
         # Grant clipboard permissions through the browser context.
         try:
-            await page.context.grant_permissions(
+            await context.grant_permissions(
                 ["clipboard-read", "clipboard-write"],
                 origin="https://huggingface.co",
             )
@@ -708,21 +888,31 @@ async def run_full_signup(email: str, password: str) -> Optional[str]:
             f.write(api_key + "\n")
         os.chmod(KEYS_FILE, 0o600)
         log(f"Token saved to {KEYS_FILE}")
-
-        # Also persist to runs DB
-        sid = os.environ.get("HF_SESSION_ID")
-        aid = os.environ.get("HF_ATTEMPT_ID")
-        try:
-            insert_key(
-                api_key,
-                attempt_id=int(aid) if aid else None,
-                session_id=int(sid) if sid else None,
-            )
-            log("Token recorded in hf_runs.db")
-        except Exception as db_exc:
-            log(f"DB key insert warning: {db_exc}")
-
         return api_key
+
+    finally:
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+        # Kill the CDP process group (bash + Chrome + Xvfb)
+        try:
+            os.killpg(os.getpgid(cdp_proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            try:
+                cdp_proc.kill()
+            except Exception:
+                pass
+        try:
+            cdp_proc.wait(timeout=5)
+        except Exception:
+            pass
+        # Port-based cleanup as fallback
+        _force_kill_cdp(port)
+        # Remove from active lists
+        if cdp_proc in _active_cdp_procs:
+            _active_cdp_procs.remove(cdp_proc)
 
 
 async def main():
@@ -730,6 +920,12 @@ async def main():
     log("=" * 60)
     log("HuggingFace Signup Automation")
     log("=" * 60)
+
+    if not _ensure_camoufox():
+        log("FATAL: camoufox not available and auto-install failed")
+        sys.exit(1)
+
+    cleanup_stale_cdp_profiles()
 
     # Check for hCaptcha cookie
     cookies = load_captcha_cookie()
@@ -749,6 +945,9 @@ async def main():
         log(f"\n{'='*60}")
         log(f"Attempt {attempt}/3")
         log(f"{'='*60}")
+
+        # Clean up any stale profiles from previous attempts
+        cleanup_stale_cdp_profiles()
 
         # Create fresh email
         email = create_agentmail_email()
@@ -787,4 +986,16 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        cleanup_all()
+        cleanup_stale_cdp_profiles()
+        import glob
+        import shutil
+        for pattern in ("/tmp/cdp_browser_profile_*", "/tmp/hf_profile_*"):
+            for d in glob.glob(pattern):
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass

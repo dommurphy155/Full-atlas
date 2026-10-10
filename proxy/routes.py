@@ -823,6 +823,12 @@ async def _stream_openai_to_anthropic(rid: str, upstream_url: str, payload: byte
             "content_block": {"type": "text", "text": ""},
         })
 
+        # Keep block lifecycle state across OpenAI SSE chunks.
+        translation_state = {
+            "thinking_started": False,
+            "tool_blocks": {},
+        }
+
         # Stream from upstream (proxy.iter_upstream_sse or proxy.forward already returned a StreamingResponse)
         async for raw in resp.body_iterator:
             if not raw:
@@ -853,7 +859,10 @@ async def _stream_openai_to_anthropic(rid: str, upstream_url: str, payload: byte
                 pass
 
             # Emit Anthropic events for each OpenAI delta
-            for evt_name, evt_data in openai_sse_to_anthropic_sse(chunk):
+            for evt_name, evt_data in openai_sse_to_anthropic_sse(
+                chunk,
+                state=translation_state,
+            ):
                 if evt_data is None:
                     continue
                 yield _sse_event(evt_name, evt_data)
