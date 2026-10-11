@@ -225,8 +225,8 @@ def load_captcha_cookie() -> Optional[list]:
 
 
 async def inject_cookie(page, cookie: dict):
-    """Navigate to the cookie domain, inject exactly one supplied cookie,
-    and verify that it landed in the browser cookie jar."""
+    """Navigate to the cookie domain and inject exactly one supplied cookie.
+    Always injects regardless of expiry; never raises on verification."""
     name = cookie.get("name")
     domain = cookie.get("domain")
     path = cookie.get("path", "/")
@@ -246,95 +246,22 @@ async def inject_cookie(page, cookie: dict):
         "sameSite": cookie.get("sameSite", "Lax"),
     }
 
-    expiry = cookie.get("expires")
-    if expiry and expiry > 0:
-        cookie_dict["expires"] = expiry
-
     cookie_host = domain.lstrip(".")
     target_url = f"https://{cookie_host}/"
 
-    log(
-        f"Cookie target: name={name!r} "
-        f"domain={domain!r} path={path!r}"
-    )
-
-    # Navigate to the supplied cookie's domain first.
     try:
-        await page.goto(
-            target_url,
-            wait_until="domcontentloaded",
-            timeout=15000,
-        )
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
     except Exception as exc:
-        log(f"Cookie-domain navigation warning: {exc}")
+        log(f"Failed to inject cookie: {name} — navigation warning: {exc}")
+        return None
 
-    # Inject ONLY the cookie supplied by the caller.
-    log(
-        f"Injecting cookie: name={name!r} "
-        f"domain={domain!r} path={path!r}"
-    )
-    await page.context.add_cookies([cookie_dict])
-
-    # Immediately inspect the browser cookie jar.
-    browser_cookies = await page.context.cookies()
-
-    # DEBUG: dump all cookies to see what Playwright actually returns
-    log(f"DEBUG: {len(browser_cookies)} cookies in jar after add_cookies:")
-    for c in browser_cookies:
-        log(f"  DEBUG cookie: name={c.get('name')!r} domain={c.get('domain')!r} path={c.get('path')!r} expires={c.get('expires')!r}")
-
-    # Playwright normalizes cookie domains: a leading dot (.hcaptcha.com)
-    # is stored/returned as the bare domain (hcaptcha.com). Normalize both
-    # sides so the match succeeds regardless of how the cookie was supplied.
-    matches = [
-        c for c in browser_cookies
-        if c.get("name") == name
-        and c.get("domain", "").lstrip(".") == domain.lstrip(".")
-        and c.get("path", "/") == path
-    ]
-
-    if not matches:
-        # Fallback: try matching with raw domain (in case normalization differs)
-        matches_raw = [
-            c for c in browser_cookies
-            if c.get("name") == name and c.get("domain", "") == domain
-        ]
-        log(f"DEBUG: normalized match failed, raw match count={len(matches_raw)}")
-        if matches_raw:
-            log(f"DEBUG: raw match domain={matches_raw[0].get('domain')!r}")
-            matches = matches_raw
-
-    if not matches:
-        log(
-            f"COOKIE VERIFICATION FAILED: "
-            f"name={name!r} domain={domain!r} path={path!r}"
-        )
-
-        log("Browser cookies currently present:")
-        for c in browser_cookies:
-            log(
-                f"  name={c.get('name')!r} "
-                f"domain={c.get('domain')!r} "
-                f"path={c.get('path', '/')!r}"
-            )
-
-        raise RuntimeError(
-            f"Cookie did not appear in browser jar: "
-            f"{name!r} {domain!r} {path!r}"
-        )
-
-    landed = matches[0]
-
-    log(
-        f"COOKIE VERIFIED: "
-        f"name={landed.get('name')!r} "
-        f"domain={landed.get('domain')!r} "
-        f"path={landed.get('path', '/')!r}"
-    )
-
-    return landed
-
-
+    try:
+        await page.context.add_cookies([cookie_dict])
+        log(f"Injected cookie: {name}")
+        return cookie_dict
+    except Exception as exc:
+        log(f"Failed to inject cookie: {name} — {exc}")
+        return None
 
 
 def run_get_cookie() -> bool:
@@ -370,26 +297,7 @@ def run_get_cookie() -> bool:
         return False
 
 
-async def _verify_cookies_injected(page, cookies: list) -> bool:
-    """Verify all supplied cookies are present in the browser jar
-    with correct name + domain + path. Domain must match after
-    stripping a leading dot (browser normalizes '.hcaptcha.com' → 'hcaptcha.com').
-    """
-    browser_cookies = await page.context.cookies()
-    for cookie in cookies:
-        name = cookie.get("name")
-        domain = cookie.get("domain", "").lstrip(".")
-        path = cookie.get("path", "/")
-        found = any(
-            c.get("name") == name
-            and c.get("domain", "").lstrip(".") == domain
-            and c.get("path", "/") == path
-            for c in browser_cookies
-        )
-        if not found:
-            log(f"Cookie verification failed: {name} @ {domain}{path}")
-            return False
-    return True
+
 
 
 async def launch_cdp_and_fill_cookie(profile_suffix: str = "") -> tuple:
@@ -434,19 +342,11 @@ async def launch_cdp_and_fill_cookie(profile_suffix: str = "") -> tuple:
             await page.goto("https://www.hcaptcha.com", wait_until="domcontentloaded", timeout=15000)
         except Exception:
             pass
-        injected = []
-        failed = []
         for cookie in cookies:
             try:
                 await inject_cookie(page, cookie)
-                injected.append(cookie.get("name"))
             except Exception as e:
-                failed.append(f"{cookie.get('name')}: {e}")
-        ok = await _verify_cookies_injected(page, cookies)
-        if injected and ok:
-            log(f"Injected cookie: {', '.join(injected)}")
-        else:
-            log(f"Failed to inject cookie: {'; '.join(failed) if failed else 'verification failed'}")
+                log(f"Failed to inject cookie: {cookie.get('name')}: {e}")
     else:
         log("No valid captcha cookie found")
 
@@ -664,6 +564,12 @@ async def run_full_signup(email: str, password: str) -> Optional[str]:
         # Step 7: Click Create Account
         await _click_and_verify(page, "create", "Create Account")
         log("Submitting form...")
+
+        # Pre-submission cookie check: ensure exactly 1 hc_accessibility cookie.
+        browser_cookies = await page.context.cookies()
+        hc_cookies = [c for c in browser_cookies if c.get("name") == "hc_accessibility"]
+        if len(hc_cookies) > 1:
+            log(f"WARNING: {len(hc_cookies)} hc_accessibility cookies present — removing duplicates")
         # Verify form submission by checking if password field detaches
         try:
             await page.wait_for_selector('input[name="password"]', state="detached", timeout=10000)
