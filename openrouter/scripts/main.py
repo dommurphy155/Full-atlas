@@ -1,596 +1,278 @@
 #!/usr/bin/env python3
 """
-Main orchestrator for OpenRouter signup automation.
-
-Flow:
-  1. Bootstrap: detect distro, install deps, prompt for API key (first run only)
-  2. Launch CDP via launch_cdp.sh (random port, Xvfb)
-  3. Burn + create fresh OpenMail email
-  4. Generate random password
-  5. Call signup_automation.py with email + password
-  6. Key is saved to data/openroute_keys.txt by signup_automation.py
-  7. Burn the email inbox
-  8. Exit cleanly
-
-Usage:
-    python3 main.py
+OpenRouter signup automation using Patchright (Chromium-based anti-detect browser).
 """
-import json
-import logging
-from logging.handlers import RotatingFileHandler
+
+import asyncio
 import os
-import random
-import string
-import subprocess
 import sys
-import time
-from datetime import datetime
+import json
+import re
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
-    PROJECT_ROOT, DATA_DIR, RUN_DIR, KEYS_FILE, ENV_FILE, LOG_DIR,
-    CDP_PORT_FILE, CDP_PID_FILE, CDP_HOST, CDP_TIMEOUT,
-    OPEN_EMAIL_SCRIPT, SIGNUP_SCRIPT, LAUNCH_CDP_SCRIPT,
-    OPENMAIL_API_KEY, ensure_dirs, find_chrome,
+    ROOT_DIR,
+    DATA_DIR,
+    STATE_FILE,
+    ENV_FILE,
+    KEYS_FILE,
+    AGENTMAIL_API_KEY,
+    AGENTMAIL_BASE,
+    VIRTUAL_DISPLAY,
+    HEADLESS,
+    BROWSER_TIMEOUT,
+    NAVIGATION_TIMEOUT,
+    SIGNUP_URL,
+    ensure_dependencies,
+    is_py_module_available,
+    install_py_module,
 )
+from agentmail import AgentMailManager
+from fingerprint import inject_fingerprint
 
 
-def get_logger():
-    """Get logger with file + stdout handlers. Idempotent."""
-    _logger = logging.getLogger("main")
-    if _logger.handlers:
-        return _logger
-    ensure_dirs()
-    _logger.setLevel(logging.INFO)
-    _fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    _fh = RotatingFileHandler(str(LOG_DIR / "orchestrator.log"), maxBytes=5*1024*1024, backupCount=3)
-    _fh.setFormatter(_fmt)
-    _sh = logging.StreamHandler(sys.stdout)
-    _sh.setFormatter(_fmt)
-    _logger.addHandler(_fh)
-    _logger.addHandler(_sh)
-    _logger.propagate = False
-    return _logger
+async def bootstrap():
+    print("[Bootstrap] Checking dependencies...")
+    ensure_dependencies()
 
+    from dotenv import load_dotenv
+    load_dotenv(ENV_FILE)
 
-logger = get_logger()
+    api_key = os.getenv("AGENTMAIL_API_KEY")
+    if not api_key:
+        print("[Bootstrap] ERROR: AGENTMAIL_API_KEY not found in .env", file=sys.stderr)
+        sys.exit(1)
 
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-def log(msg: str):
-    logger.info(msg)
-
-
-def detect_distro():
-    """Detect Linux distribution and package manager."""
-    try:
-        os_release = Path("/etc/os-release").read_text()
-        info = {}
-        for line in os_release.strip().splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                info[k.strip().lower()] = v.strip().strip("\"'")
-        distro_id = info.get("id", "unknown")
-        distro_name = info.get("name", "Unknown")
-        return distro_id, distro_name
-    except Exception:
-        return "unknown", "Unknown"
-
-
-def is_debian_like(distro_id):
-    return distro_id in ("debian", "ubuntu", "mint", "pop")
-
-
-def _chrome_present() -> bool:
-    """Check if Chrome/Chromium is already installed via any known binary path."""
-    return find_chrome() is not None
-
-
-def _add_google_chrome_repo() -> bool:
-    """Add Google's apt repo so google-chrome-stable is installable.
-    It is NOT in default Ubuntu/Debian repos."""
-    try:
-        subprocess.run(
-            ["bash", "-c",
-             "curl -fsSL https://dl.google.com/linux/linux_signing_key.pub "
-             "| gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg 2>/dev/null"],
-            capture_output=True, timeout=30,
-        )
-        subprocess.run(
-            ["bash", "-c",
-             'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] '
-             'http://dl.google.com/linux/chrome/deb/ stable main" '
-             "> /etc/apt/sources.list.d/google-chrome.list"],
-            capture_output=True, timeout=15,
-        )
-        result = subprocess.run(["apt-get", "update", "-qq"], capture_output=True, timeout=120)
-        return result.returncode == 0
-    except Exception as e:
-        log(f"Could not add Google Chrome repo: {e}")
-        return False
-
-
-def install_system_deps(distro_id, distro_name):
-    """Install required system packages via apt. Never raises — always
-    returns True/False and lets the caller decide whether to proceed
-    with degraded capability instead of crashing the whole run."""
-    if not is_debian_like(distro_id):
-        log(f"Distro '{distro_name}' is not Debian-like. Please install manually:")
-        log("  apt-get install -y xvfb google-chrome-stable curl fuser")
-        return _chrome_present()  # ok to proceed if Chrome/Chromium already present
-
-    log(f"Detected {distro_name}. Installing system deps via apt...")
-    pkgs = ["xvfb", "curl", "psmisc"]  # psmisc provides fuser
-
-    cmd = ["apt-get", "update", "-qq"]
-    subprocess.run(cmd, capture_output=True, timeout=120)
-
-    cmd = ["apt-get", "install", "-y", "-qq"] + pkgs
-    result = subprocess.run(cmd, capture_output=True, timeout=300)
-    if result.returncode != 0:
-        log(f"WARNING: base apt-get install failed: {result.stderr.decode()[:300]}")
-        # Non-fatal — keep going, Chrome check below is what actually matters
-
-    if _chrome_present():
-        log("Chrome/Chromium already installed.")
-    else:
-        log("Chrome not found — attempting install via google-chrome-stable...")
-        result = subprocess.run(
-            ["apt-get", "install", "-y", "-qq", "google-chrome-stable"],
-            capture_output=True, timeout=300,
-        )
-        if result.returncode != 0:
-            log("google-chrome-stable not found in default repos — adding Google's apt repo...")
-            if _add_google_chrome_repo():
-                result = subprocess.run(
-                    ["apt-get", "install", "-y", "-qq", "google-chrome-stable"],
-                    capture_output=True, timeout=300,
-                )
-            if result.returncode != 0:
-                log("google-chrome-stable install failed — trying chromium as fallback...")
-                subprocess.run(
-                    ["apt-get", "install", "-y", "-qq", "chromium-browser"],
-                    capture_output=True, timeout=300,
-                )
-
-    if not _chrome_present():
-        log("WARNING: No Chrome/Chromium binary found after install attempts. "
-            "Set CHROME_BIN env var to a valid browser path, or install manually:")
-        log("  sudo apt-get install -y google-chrome-stable")
-        log("Continuing anyway — CDP launch will fail loudly later if still missing.")
-
-    log("System dependency setup complete.")
-    return True  # Never block bootstrap on this — let CDP launch surface the real error if any
-
-
-def install_py_deps():
-    """Install required Python packages via pip or uv."""
-    import importlib
-
-    deps = {
-        "httpx": "httpx",
-        "dotenv": "python-dotenv",
-        "patchright": "patchright",
-    }
-    missing = []
-    for mod, pkg in deps.items():
-        try:
-            importlib.import_module(mod)
-        except ImportError:
-            missing.append(pkg)
-
-    if not missing:
-        log("All Python dependencies already installed.")
-        return True
-
-    log(f"Installing Python deps: {', '.join(missing)}")
-
-    # Try pip first, then uv as fallback
-    installed = False
-    try:
-        # Try with --break-system-packages for PEP 668 environments
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--break-system-packages", "--quiet"] + missing,
-            capture_output=True, timeout=300,
-        )
-        if result.returncode != 0:
-            # Retry without the flag (in case it's not supported)
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
-                capture_output=True, timeout=300,
-            )
-        if result.returncode == 0:
-            installed = True
-    except Exception:
-        pass
-
-    if not installed:
-        # Fall back to uv targeting the current venv
-        result = subprocess.run(
-            ["uv", "pip", "install", "--python", sys.executable, "--quiet"] + missing,
-            capture_output=True, timeout=300,
-        )
-        if result.returncode != 0:
-            log(f"pip/uv install failed: {result.stderr.decode()[:500]}")
-            return False
-
-    # Install chromium for patchright if not already present
-    try:
-        importlib.import_module("patchright")
-        result = subprocess.run(
-            [sys.executable, "-m", "patchright", "install", "chromium"],
-            capture_output=True, timeout=300,
-        )
-        if result.returncode != 0:
-            # Try via uv if patchright is in a different location
-            pass
-    except ImportError:
-        pass
-
-    log("Python dependencies installed.")
-    return True
-
-
-def is_first_run():
-    """Check if .env config exists with required keys."""
-    if not ENV_FILE.exists():
-        return True
-    content = ENV_FILE.read_text()
-    return "OPENMAIL_API_KEY=" not in content or "OPENMAIL_API_KEY=\"\"" in content or "OPENMAIL_API_KEY=''" in content
-
-
-def bootstrap():
-    """First-run bootstrap: install deps, prompt for API key."""
-    if not is_first_run():
-        log("Setup already complete — skipping bootstrap.")
-        return
-
-    log("=" * 60)
-    log("First-Run Setup")
-    log("=" * 60)
-
-    # 1. Detect distro
-    distro_id, distro_name = detect_distro()
-    log(f"Detected: {distro_name} ({distro_id})")
-
-    # 2. Install system deps — warn but never abort the whole run over this
-    if not install_system_deps(distro_id, distro_name):
-        log("WARNING: system dependency installation had issues — continuing anyway.")
-
-    # 3. Install Python deps
-    if not install_py_deps():
-        raise RuntimeError(
-            "Required Python dependencies could not be installed."
-        )
-
-    # 4. Check Chrome
-    chrome = find_chrome()
-    if not chrome:
-        log("WARNING: Chrome/Chromium not found. Install google-chrome or set CHROME_BIN env var.")
-    else:
-        log(f"Chrome found: {chrome}")
-
-    # 5. Prompt for API keys
-    log("\nRequired API keys:")
-    log("  1. OPENMAIL_API_KEY — get from https://openmail.sh")
-    log("  2. OPENROUTER_API_KEY (optional, for verification)")
-
-    openmail_key = None
-    try:
-        openmail_key = input("  OPENMAIL_API_KEY: ").strip()
-        while not openmail_key:
-            log("  OPENMAIL_API_KEY is required.")
-            openmail_key = input("  OPENMAIL_API_KEY: ").strip()
-    except EOFError:
-        pass
-
-    if not openmail_key:
-        # Fallback: try from environment
-        openmail_key = os.environ.get("OPENMAIL_API_KEY", "")
-        if openmail_key:
-            log(f"Using OPENMAIL_API_KEY from environment")
-        else:
-            log("ERROR: OPENMAIL_API_KEY is required. Set it in .env or as env var.")
-            sys.exit(1)
-
-    optional_key = ""
-    try:
-        optional_key = input("  OPENROUTER_API_KEY (optional, press Enter to skip): ").strip()
-    except EOFError:
-        # Use env var if available
-        optional_key = os.environ.get("OPENROUTER_API_KEY", "")
-
-    ensure_dirs()
-    config_content = f'OPENMAIL_API_KEY="{openmail_key}"\n'
-    if optional_key:
-        config_content += f'OPENROUTER_API_KEY="{optional_key}"\n'
-
-    ENV_FILE.write_text(config_content)
-    os.chmod(ENV_FILE, 0o600)
-    log(f"Config written to {ENV_FILE}")
-    log("=" * 60)
-
-
-def find_free_port() -> int:
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
-
-
-def wait_for_cdp(port: int, timeout: int = CDP_TIMEOUT) -> bool:
-    import urllib.request
-    cdp_url = f"http://{CDP_HOST}:{port}/json/version"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(cdp_url, timeout=3) as resp:
-                if resp.status == 200:
-                    return True
-        except Exception:
-            pass
-        time.sleep(0.5)
-    return False
-
-
-def launch_cdp(port: int):
-    """Launch CDP browser via launch_cdp.sh. Returns Popen handle."""
-    log(f"Launching CDP on port {port}...")
-
-    env = {
-        **os.environ,
-        "CDP_PORT": str(port),
-        "CDP_PORT_FILE": str(CDP_PORT_FILE),
-    }
-
-    # Do not force DISPLAY. launch_cdp.sh decides whether an existing
-    # X display is usable and otherwise falls back to headless Chrome.
-    proc = subprocess.Popen(
-        ["bash", str(LAUNCH_CDP_SCRIPT)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
-        cwd=str(PROJECT_ROOT),
-    )
-
-    # Stream launch_cdp.sh output for visibility
-    def stream_output():
-        if proc.stdout:
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    print(f"  [CDP] {line}", flush=True)
-
-    import threading
-    t = threading.Thread(target=stream_output, daemon=True)
-    t.start()
-
-    if not wait_for_cdp(port, timeout=CDP_TIMEOUT):
-        log("CDP failed to start!")
-        proc.kill()
-        raise RuntimeError("CDP did not become ready")
-
-    log(f"CDP ready on port {port}")
-    return proc
-
-
-def create_openmail_email() -> str | None:
-    load_env()
-    log("Burning all existing OpenMail inboxes...")
-    # Burn uses the first working key; it will exit(1) if all keys exhausted
-    burn_result = subprocess.run(
-        [sys.executable, str(OPEN_EMAIL_SCRIPT), "burn"],
-        capture_output=True, text=True, timeout=60,
-        cwd=str(PROJECT_ROOT),
-    )
-    if burn_result.returncode != 0:
-        # Log burn output but continue — create_inbox will try all keys anyway
-        log(f"Burn warning (continuing): {burn_result.stderr.strip()}")
-
-    log("Creating fresh OpenMail inbox...")
-    # Creates inbox using whichever API key has quota (tries keys 1..5)
+    print("[Bootstrap] Checking Patchright browser...")
+    import subprocess
     result = subprocess.run(
-        [sys.executable, str(OPEN_EMAIL_SCRIPT), "create"],
-        capture_output=True, text=True, timeout=60,
-        cwd=str(PROJECT_ROOT),
+        [sys.executable, "-m", "patchright", "install", "chromium"],
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
-        # Combine stderr and stdout for full error context
-        error_msg = result.stderr.strip() or result.stdout.strip()
-        log(f"Failed to create email: {error_msg}")
-        return None
-    email = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
-    if not email:
-        log("Empty email address returned")
-        return None
-    log(f"Email created")  # already short, keep as-is
-    return email
+        print(f"[Bootstrap] Patchright install failed: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    print("[Bootstrap] All checks passed!")
+    return api_key
 
 
-def generate_password() -> str:
-    chars = string.ascii_letters + string.digits
-    password = "".join(random.choice(chars) for _ in range(16))
-    password += "!A1"
-    return password
+async def create_email(api_key: str) -> str:
+    print("[Email] Creating fresh AgentMail inbox...")
+    mgr = AgentMailManager(api_key)
 
+    print("[Email] Nuking all existing inboxes...")
+    await mgr.nuke_all()
+    await asyncio.sleep(2)
 
-def run_signup(email: str, password: str) -> bool:
-    log("Starting signup automation...")
-    proc = subprocess.Popen(
-        [sys.executable, str(SIGNUP_SCRIPT), email],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        cwd=str(PROJECT_ROOT),
-    )
-    proc.stdin.write(password + "\n")
-    proc.stdin.close()
-
-    if proc.stdout:
-        for line in iter(proc.stdout.readline, ""):
-            line = line.rstrip()
-            if line:
-                print(f"  {line}", flush=True)
-
-    try:
-        proc.wait(timeout=600)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        log("Signup automation timed out (600s)")
-        return False
-
-    if proc.returncode == 0:
-        log("Signup automation completed successfully")
-        return True
-    else:
-        log(f"Signup automation failed (exit code {proc.returncode})")
-        return False
-
-
-def cleanup_cdp(port: int):
-    """Clean up only the Chrome process owned by this project."""
-    if CDP_PID_FILE.exists():
-        try:
-            raw = CDP_PID_FILE.read_text().strip()
-            CDP_PID_FILE.unlink(missing_ok=True)
-
-            for value in raw.split():
-                try:
-                    pid = int(value)
-                    os.kill(pid, 15)
-                except (ProcessLookupError, ValueError, PermissionError):
-                    pass
-        except Exception as e:
-            logger.warning(f"CDP PID cleanup failed: {e}")
-
-    # Fallback for stale PID files.
-    try:
-        subprocess.run(
-            ["fuser", "-k", f"{port}/tcp"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
+    inbox = await mgr.create_inbox()
+    inbox_id = inbox.get("inbox_id") or inbox.get("id")
+    address = inbox.get("address") or inbox.get("email")
+    if not address:
+        local = (
+            inbox.get("local_part")
+            or inbox.get("username")
+            or inbox.get("local")
+            or inbox.get("name")
         )
-    except Exception:
-        pass
+        domain = inbox.get("domain") or "agentmail.to"
+        if not local:
+            raise RuntimeError(f"Cannot find local part in response: {inbox}")
+        address = f"{local}@{domain}"
+
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps({"inbox_id": inbox_id, "address": address}) + "\n", encoding="utf-8")
+
+    print(f"[Email] Created: {address}")
+    return address
 
 
-def load_env():
-    """Load .env file if it exists."""
-    if ENV_FILE.exists():
-        with open(ENV_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if line and "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
+async def get_verification_url(api_key: str, timeout: int = 180) -> str:
+    print("[Email] Waiting for OpenRouter verification email...")
+    if not STATE_FILE.exists():
+        raise RuntimeError("No state file found. Run create first.")
 
+    state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    inbox_id = state["inbox_id"]
+    mgr = AgentMailManager(api_key)
 
-def main():
-    # Set up CDP_PORT for launch_cdp.sh and signup_automation.py
-    port = find_free_port()
-    os.environ["CDP_PORT"] = str(port)
-    os.environ["CDP_PORT_FILE"] = str(CDP_PORT_FILE)
-
-    # First-run bootstrap
-    bootstrap()
-
-    # Reload env after .env is written
-    load_env()
-
-    # Ensure dirs exist
-    ensure_dirs()
-
-    # Purge stale debug artifacts (screenshots/HTML dumps) from prior
-    # runs so failure debugging never leaks disk space over time.
-    for pattern in ["debug_*.png", "debug_*.html", "signup_form_missing.png"]:
-        for stale in DATA_DIR.glob(pattern):
+    start = asyncio.get_event_loop().time()
+    async with __import__("httpx").AsyncClient() as client:
+        while asyncio.get_event_loop().time() - start < timeout:
             try:
-                stale.unlink()
-            except Exception:
-                pass
+                r = await client.get(f"{AGENTMAIL_BASE}/inboxes/{inbox_id}/messages", headers=mgr._headers(), timeout=30)
+                data = r.json()
+                msgs = data if isinstance(data, list) else data.get("messages", [])
+                for msg in msgs:
+                    msg_id = (msg.get("id") or msg.get("message_id") or msg.get("uid") or msg.get("messageId"))
+                    if not msg_id:
+                        continue
 
-    log("=" * 60)
-    log("OpenRouter Signup Automation")
-    log("=" * 60)
+                    mr = await client.get(f"{AGENTMAIL_BASE}/inboxes/{inbox_id}/messages/{msg_id}", headers=mgr._headers(), timeout=30)
+                    msg_data = mr.json()
+                    full_html = msg_data.get("html", "") or msg_data.get("extracted_html", "") or msg_data.get("body", "") or ""
+                    import html
+                    full_html = html.unescape(full_html)
 
-    # Retry logic: up to 3 attempts
-    for attempt in range(1, 4):
-        log(f"\n{'='*60}")
-        log(f"Attempt {attempt}/3")
-        log(f"{'='*60}")
+                    m = re.search(r'https://clerk[.]openrouter[.]ai/v1/verify\?[^\s"\'<>]+', full_html)
+                    if m:
+                        return m.group()
 
-        port = find_free_port()
-        os.environ["CDP_PORT"] = str(port)
-        os.environ["CDP_PORT_FILE"] = str(CDP_PORT_FILE)
+                    m = re.search(r'https://openrouter[.]ai/verify/[^\s"\'<>]+', full_html)
+                    if m:
+                        return m.group()
 
-        cdp_proc = None
+                    m = re.search(r'(?:href|src)=["\']([^"\']*clerk[.]openrouter[.]ai/v1/verify[^"\']*)["\']', full_html, re.I)
+                    if m:
+                        return m.group(1)
+
+                    m = re.search(r'(?:href|src)=["\']([^"\']*openrouter[.]ai/verify[^"\']*)["\']', full_html, re.I)
+                    if m:
+                        return m.group(1)
+            except Exception as e:
+                print(f"[Email] Poll error: {e}", file=sys.stderr)
+            await asyncio.sleep(6)
+
+    raise RuntimeError("Timed out waiting for verification URL")
+
+
+async def run_signup(email: str, password: str = "K7#mP9$vL2@nQ5!xR4&wE8*zT1") -> str:
+    print("[Browser] Launching Patchright (headed on virtual display :1)...")
+
+    from patchright.async_api import async_playwright
+    import tempfile
+    import uuid
+    import shutil
+
+    # Create unique user data dir for complete isolation each run
+    user_data_dir = tempfile.mkdtemp(prefix=f"chrome_profile_{uuid.uuid4().hex[:8]}_")
+
+    # Start Xvfb on display :1 if not already running
+    import subprocess
+    xvfb_proc = subprocess.Popen(
+        ["Xvfb", ":1", "-screen", "0", "1920x1080x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # Give Xvfb a moment to start
+    await asyncio.sleep(1)
+
+    # Set DISPLAY for the browser
+    os.environ["DISPLAY"] = VIRTUAL_DISPLAY
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=HEADLESS,
+            channel="chrome",
+        )
+        
+        context = browser
+        
+        page = await context.new_page()
+        page.set_default_timeout(BROWSER_TIMEOUT)
+
+        # Inject Mac Mini fingerprint before any navigation
+        await inject_fingerprint(page)
+
         try:
-            cdp_proc = launch_cdp(port)
+            print(f"[Browser] Navigating to {SIGNUP_URL}...")
+            await page.goto(SIGNUP_URL, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
 
-            email = create_openmail_email()
-            if not email:
-                log("Could not create email, retrying...")
-                continue
+            print("[Browser] Waiting for form to be ready...")
+            await page.wait_for_selector('#emailAddress-field', state="visible", timeout=30000)
+            await page.wait_for_function("() => document.querySelector('#emailAddress-field')?.offsetParent !== null", timeout=10000)
 
-            password = generate_password()
-            log("Generated password (not shown)")
+            print("[Browser] Filling email field...")
+            await page.fill('#emailAddress-field', email)
 
-            success = run_signup(email, password)
+            print("[Browser] Filling password field...")
+            await page.fill('#password-field', password)
 
-            if success:
-                if KEYS_FILE.exists():
-                    keys = [k for k in KEYS_FILE.read_text().strip().splitlines() if k.strip()]
-                    log(f"\n=== SUCCESS ===")
-                    log(f"Total keys now: {len(keys)}")
-                    log(f"Saved to: {KEYS_FILE}")
-                    log("=" * 60)
-                    sys.exit(0)
+            print("[Browser] Clicking legal acceptance checkbox...")
+            await page.check('#legalAccepted-field')
+
+            print("[Browser] Clicking signup button...")
+            await page.click('button.cl-formButtonPrimary.cl-button[data-localization-key="formButtonPrimary"][data-variant="solid"][data-color="primary"]')
+
+            print("[Browser] Waiting for navigation after signup...")
+            await page.wait_for_load_state("domcontentloaded", timeout=NAVIGATION_TIMEOUT)
+            await page.wait_for_url("**/*", timeout=NAVIGATION_TIMEOUT)
+
+            print("[Browser] Signup form submitted, checking email for verification...")
+            verification_url = await get_verification_url(os.getenv("AGENTMAIL_API_KEY"))
+
+            print("[Browser] Navigating to verification url")
+            await page.goto(verification_url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT)
+            await page.wait_for_load_state("networkidle", timeout=15000)
+
+            print("[Browser] Clicking Next button...")
+            await page.wait_for_selector('button:has-text("Next"), button:has-text("Verify"), button:has-text("Continue"), button[type="submit"], button[type="button"]', state="visible", timeout=30000)
+            await page.click('button:has-text("Next"), button:has-text("Verify"), button:has-text("Continue"), button[type="submit"], button[type="button"]')
+
+            print("[Browser] Waiting for API key page...")
+            await page.wait_for_load_state("domcontentloaded", timeout=NAVIGATION_TIMEOUT)
+            await page.wait_for_selector('button[aria-label="Copy API key to clipboard"]', state="visible", timeout=30000)
+
+            print("[Browser] Clicking copy API key button...")
+            copy_button = page.locator('button[aria-label="Copy API key to clipboard"]')
+            await copy_button.wait_for(state="visible", timeout=10000)
+            await copy_button.click()
+
+            print("[Browser] Extracting API key from page...")
+            await page.wait_for_timeout(1000)
+            page_text = await page.locator('code, pre, [data-api-key]').first.text_content()
+            if page_text:
+                import re
+                m = re.search(r'(sk-or-v1-[a-zA-Z0-9]+)', page_text)
+                if m:
+                    api_key = m.group(1)
                 else:
-                    log("Key file not found after successful signup — unexpected")
-            else:
-                log("Signup failed, will retry...")
+                    api_key = page_text.strip()
+            if not api_key or len(api_key) < 20:
+                raise RuntimeError("Failed to extract API key")
+
+            print(f"[Browser] Got API key: {api_key[:20]}...")
+
+            KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(KEYS_FILE, "a") as f:
+                f.write(f"{api_key}\n")
+            print(f"[Browser] Saved API key to {KEYS_FILE}")
+
+            await context.close()
+            await browser.close()
+            xvfb_proc.terminate()
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+            return api_key
 
         except Exception as e:
-            log(f"ERROR: {e}")
+            await context.close()
+            await browser.close()
+            xvfb_proc.terminate()
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+            raise
 
-        finally:
-            if cdp_proc:
-                try:
-                    cdp_proc.terminate()  # SIGTERM lets launch_cdp.sh's trap clean its own profile dir
-                    cdp_proc.wait(timeout=8)
-                except Exception:
-                    try:
-                        cdp_proc.kill()
-                        cdp_proc.wait(timeout=5)
-                    except Exception:
-                        pass
-            cleanup_cdp(port)
-            # Force-delete ANY leftover chrome-profile dirs regardless of
-            # whether the trap fired — never let a profile survive a run.
-            import shutil as _shutil
-            for stale_profile in RUN_DIR.glob("chrome-profile.*"):
-                try:
-                    _shutil.rmtree(stale_profile, ignore_errors=True)
-                except Exception:
-                    pass
 
-        if attempt < 3:
-            log("Waiting 10s before retry...")
-            time.sleep(10)
+async def main():
+    print("=" * 50)
+    print("OpenRouter Signup Automation (Patchright)")
+    print("=" * 50)
 
-    log("\n=== FAILED: all 3 attempts exhausted ===")
-    sys.exit(1)
+    api_key = await bootstrap()
+    email = await create_email(api_key)
+
+    try:
+        result = await run_signup(email)
+        print(f"\n[SUCCESS] OpenRouter API key saved: {result[:20]}...")
+    except Exception as e:
+        print(f"\n[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

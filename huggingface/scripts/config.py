@@ -85,7 +85,7 @@ PASSWORD = "HuggingFace2024!SecurePass#7"
 # get_cookie.py / hf_keys.py configuration                                       #
 # --------------------------------------------------------------------------- #
 
-FIREFOX_PROFILES_DIR = PROJECT_ROOT / "data" / "firefox_profiles"
+CHROME_PROFILES_DIR = PROJECT_ROOT / "data" / "chrome_profiles"
 TARGET_COOKIE_NAME = "hc_accessibility"
 TARGET_URL = "https://dashboard.hcaptcha.com/login"
 SUCCESS_TEXT = "Set Cookie"
@@ -114,7 +114,7 @@ def setup_logging(name: str) -> logging.Logger:
 def first_run_setup() -> None:
     """Ensure required directories exist."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    FIREFOX_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    CHROME_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _ensure_dirs() -> None:
@@ -128,16 +128,15 @@ def _ensure_dirs() -> None:
 
 REQUIRED_DIRS = [
     DATA_DIR,
-    FIREFOX_PROFILES_DIR,
+    CHROME_PROFILES_DIR,
     DATA_DIR.parent,  # ~/atlas/data
 ]
 
 REQUIRED_PACKAGES = [
-    "camoufox",
     "playwright",
+    "patchright",
     "httpx",
     "python-dotenv",
-    "patchright",
 ]
 
 
@@ -440,16 +439,16 @@ def _ensure_env_file_interactive() -> None:
 
 
 def _ensure_profiles_interactive() -> None:
-    """If no Firefox profiles exist, run add_captcha_account.py interactively."""
-    if not FIREFOX_PROFILES_DIR.exists() or not any(
-        p.is_dir() for p in FIREFOX_PROFILES_DIR.iterdir()
+    """If no Chrome profiles exist, run add_captcha_account.py interactively."""
+    if not CHROME_PROFILES_DIR.exists() or not any(
+        p.is_dir() for p in CHROME_PROFILES_DIR.iterdir()
     ):
-        print("\n  [SETUP] No Firefox profiles found.")
+        print("\n  [SETUP] No Chrome profiles found.")
         print("  [SETUP] You need at least one hCaptcha-verified profile to bypass")
         print("  [SETUP] hCaptcha challenges on HuggingFace signup.")
         print()
         print("  [SETUP] add_captcha_account.py will:")
-        print("  [SETUP]   1. Install camoufox + playwright if missing")
+        print("  [SETUP]   1. Install patchright + chromium browser if missing")
         print("  [SETUP]   2. Launch a browser window on display :1")
         print("  [SETUP]   3. Prompt you for your hCaptcha dashboard email")
         print("  [SETUP]   4. You manually log in, click 'Set Cookie'")
@@ -471,8 +470,8 @@ def _ensure_profiles_interactive() -> None:
 
         print("  [SETUP] Profile created successfully.")
     else:
-        profiles = [p for p in FIREFOX_PROFILES_DIR.iterdir() if p.is_dir()]
-        print(f"  [SETUP] {len(profiles)} Firefox profile(s) found — skipping profile setup.")
+        profiles = [p for p in CHROME_PROFILES_DIR.iterdir() if p.is_dir()]
+        print(f"  [SETUP] {len(profiles)} Chrome profile(s) found — skipping profile setup.")
 
 
 def _ensure_system_deps(info: dict) -> None:
@@ -516,7 +515,7 @@ def bootstrap() -> None:
     """Interactive first-run bootstrap for the HuggingFace signup automation.
 
     Detects OS, creates dirs, prompts for missing API keys, installs system
-    and Python deps, and walks the user through creating their first Firefox
+    and Python deps, and walks the user through creating their first Chrome
     profile if none exist.  Nothing runs silently — every step is interactive.
     """
     print("=" * 60)

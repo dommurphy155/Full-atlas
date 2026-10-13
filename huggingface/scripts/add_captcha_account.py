@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Create and save reusable Camoufox (Firefox) profiles that stay logged into hCaptcha.
+Create and save reusable Patchright (Chrome) profiles that stay logged into hCaptcha.
 
 Works for anyone, not just noVNC-local users: this script boots a temporary
 noVNC session (if one isn't already running) so the login can be completed
 from any browser, anywhere, via a URL + password.
 
 Saves each profile cleanly to:
-    ~/atlas/data/firefox_profiles/{email_slug}/
+    ~/atlas/data/chrome_profiles/{email_slug}/
 
 Usage:
-    python add_captcha_account.py [--port 6080]
+    python add_captcha_account_patchright.py [--port 6080]
 """
 
 from __future__ import annotations
@@ -43,13 +43,13 @@ from config import (
     is_py_module_available,
     install_py_module,
     is_binary_available,
-    is_camoufox_browser_installed,
-    ensure_camoufox_browsers,
     ensure_system_deps,
     install_system_deps,
+    is_patchright_browser_installed,
+    ensure_playwright_browsers,
 )
 
-PROFILES_ROOT = Path.home() / "atlas" / "data" / "firefox_profiles"
+PROFILES_ROOT = Path.home() / "atlas" / "data" / "chrome_profiles"
 
 VALID_DOMAINS = {
     "google": "gmail.com",
@@ -91,7 +91,6 @@ def bold(t: str) -> str: return Colors._wrap(Colors.BOLD, t)
 
 
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Shared dependency self-installing preamble
 # ---------------------------------------------------------------------------
 
@@ -100,22 +99,21 @@ def _ensure_self_contained() -> None:
 
     All checks are performed system-wide — nothing is assumed to be local
     or repo-relative.  Each check delegates to config.py's shared detection
-    functions so logic stays consistent across get_cookie.py,
-    add_captcha_account.py, and main.py.
+    functions so logic stays consistent across scripts.
     """
     PROFILES_ROOT.mkdir(parents=True, exist_ok=True)
 
     # --- Python packages (checked via importlib, not repo-relative) ---
-    deps = {"camoufox": "camoufox", "playwright": "playwright"}
+    deps = {"patchright": "patchright"}
     for module_name, pip_name in deps.items():
         if not is_py_module_available(module_name):
             print(f"  [setup] Installing {pip_name} ...", file=sys.stderr)
             install_py_module(module_name, pip_name)
 
-    # --- Camoufox browser binaries (checked in ~/.cache/camoufox/) ---
-    if not is_camoufox_browser_installed():
-        print("  [setup] Downloading camoufox browsers ...", file=sys.stderr)
-        ensure_camoufox_browsers()
+    # --- Patchright Chromium/Chrome binaries ---
+    if not is_patchright_browser_installed():
+        print("  [setup] Downloading patchright chromium browsers ...", file=sys.stderr)
+        ensure_playwright_browsers()
 
     # --- System binaries: Xvfb, x11vnc, websockify, novnc (shutil.which) ---
     missing = ensure_system_deps()
@@ -128,8 +126,7 @@ def _ensure_self_contained() -> None:
 
 _ensure_self_contained()
 
-from camoufox.sync_api import Camoufox
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from patchright.sync_api import sync_playwright
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +382,7 @@ def click_provider_button(page, provider: str) -> bool:
         try:
             page.get_by_text(text, exact=False).first.click(timeout=8000)
             return True
-        except PlaywrightTimeoutError:
+        except TimeoutError:
             continue
     return False
 
@@ -440,25 +437,27 @@ def print_access_instructions(stack: DisplayStack) -> None:
 def run_authentication_flow(spec: AccountSpec, stack: DisplayStack) -> Path:
     os.environ["DISPLAY"] = stack.display
 
-    temp_root = Path(tempfile.mkdtemp(prefix="camoufox_profile_"))
+    temp_root = Path(tempfile.mkdtemp(prefix="patchright_profile_"))
     print(cyan(f"  ● Temp profile: {temp_root}"))
 
-    print(yellow(f"  Launching Camoufox on {stack.display} ..."))
-    with Camoufox(
-        persistent_context=True,
-        user_data_dir=str(temp_root),
-        headless=False,
-    ) as context:
+    print(yellow(f"  Launching Patchright Chrome on {stack.display} ..."))
 
-        page = context.pages[0] if context.pages else context.new_page()
+    with sync_playwright() as p:
+        # Best stealth configuration per patchright docs:
+        # - Use Google Chrome (not Chromium) with channel="chrome"
+        # - No custom headers or user_agent injection
+        # - Persistent context to keep session cookies
+        browser = p.chromium.launch_persistent_context(
+            user_data_dir=str(temp_root),
+            channel="chrome",
+            headless=False,
+            no_viewport=True,
+        )
+
+        page = browser.new_page()
 
         print(yellow(f"  Navigating to {spec.target_url}"))
-        page.goto(spec.target_url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
-        print(green("  ✓ Page loaded"))
+        page.goto(spec.target_url, timeout=PAGE_LOAD_TIMEOUT)
 
         print(yellow(f"  Clicking {spec.oauth_provider.title()} button ..."))
         if not click_provider_button(page, spec.oauth_provider):
@@ -483,6 +482,7 @@ def run_authentication_flow(spec: AccountSpec, stack: DisplayStack) -> Path:
             sys.exit(1)
 
         print(yellow("  Closing browser and flushing profile ..."))
+        browser.close()
 
     time.sleep(1.5)
     return temp_root
@@ -497,7 +497,10 @@ def copy_profile_clean(src: Path, dst: Path) -> None:
         shutil.rmtree(dst)
 
     def ignore_transient(directory, files):
-        ignore = {"lock", "parent.lock", ".parentlock", "Session Storage"}
+        ignore = {
+            "lock", "parent.lock", ".parentlock",
+            "Session Storage",
+        }
         return [f for f in files if f in ignore]
 
     shutil.copytree(src, dst, ignore=ignore_transient)
@@ -517,8 +520,9 @@ def save_profile(spec: AccountSpec, source_dir: Path) -> Path:
         f'  "email": "{spec.email}",\n'
         f'  "provider": "{spec.domain_key}",\n'
         f'  "created_at": "{now}",\n'
-        f'  "engine": "camoufox",\n'
-        f'  "source": "add_captcha_account.py"\n'
+        f'  "engine": "patchright",\n'
+        f'  "browser": "chrome",\n'
+        f'  "source": "add_captcha_account_patchright.py"\n'
         "}\n"
     )
     return dest
@@ -529,9 +533,13 @@ def save_profile(spec: AccountSpec, source_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create a Camoufox hCaptcha profile.")
-    parser.add_argument("--port", type=int, default=DEFAULT_NOVNC_PORT,
-                         help=f"noVNC port to expose (default: {DEFAULT_NOVNC_PORT})")
+    parser = argparse.ArgumentParser(
+        description="Create a Patchright hCaptcha Chrome profile."
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_NOVNC_PORT,
+        help=f"noVNC port to expose (default: {DEFAULT_NOVNC_PORT})"
+    )
     return parser.parse_args()
 
 
@@ -540,7 +548,7 @@ def main() -> int:
 
     print()
     print(bold("  ════════════════════════════════════════════════════"))
-    print(bold("   Atlas — Camoufox hCaptcha Profile Creator"))
+    print(bold("   Atlas — Patchright hCaptcha Profile Creator"))
     print(bold("  ════════════════════════════════════════════════════"))
     print()
 
@@ -580,9 +588,9 @@ def main() -> int:
 
     print()
     print(green("  ┌──────────────────────────────────────────────────────────┐"))
-    print(green("  │  Camoufox profile saved successfully.                  │"))
+    print(green("  │  Patchright Chrome profile saved successfully.          │"))
     print(green(f"  │  Location: {str(saved)[:46]:<46s} │"))
-    print(green("  │  Ready for reuse with Camoufox.                        │"))
+    print(green("  │  Ready for reuse with Patchright/Playwright.            │"))
     print(green("  └──────────────────────────────────────────────────────────┘"))
     print()
     return 0
