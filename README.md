@@ -4,7 +4,7 @@ One command to manage a monetization proxy, automated key generation, and a prom
 
 Atlas provides:
 
-- **Atlas Proxy** — a FastAPI reverse proxy that translates OpenAI / Anthropic API calls to OpenRouter, with key rotation, cooldown management, and SSE streaming.
+- **Atlas Proxy** — a FastAPI reverse proxy that translates OpenAI / Anthropic API calls to OpenRouter, HuggingFace, and NVIDIA APIs using automatically-rotated API keys.
 - **Provider automation** — headless browser bots that automatically sign up for free API keys from OpenRouter, NVIDIA, and HuggingFace using AgentMail for email verification.
 - **Atlas CLI** — a single `atlas` command to start/stop services, manage keys, run diagnostics, and launch provider automation.
 - **Prompt Pack** — 15 project briefs for AI coding harnesses.
@@ -88,7 +88,7 @@ The CLI is a standalone executable at `atlas/bin/atlas` (or available on `PATH` 
 | `atlas shell`        | Open a shell with Atlas environment variables (`ANTHROPIC_BASE_URL`, `ATLAS_PROXY_URL`, etc.) |
 | `atlas status`       | Show status of proxy + all automation processes + key files                                   |
 | `atlas logs`         | Show log file locations for all services                                                      |
-| `atlas restart`      | Restart proxy only                                                                            |
+| `atlas restart`      | Restart proxy (use `--huggingface` or `--nvidia` to select provider)                        |
 | `atlas stop`         | Stop proxy only                                                                               |
 | `atlas start`        | Start proxy only                                                                              |
 | `atlas keys`         | Show key counts for all three providers                                                       |
@@ -223,7 +223,7 @@ Each provider lives in its own directory with a `scripts/` subdirectory containi
 | Detail       | Value                                                                             |
 | ------------ | --------------------------------------------------------------------------------- |
 | Directory    | `nvidia/`                                                                         |
-| Keys file    | `data/nvidia_data/nvda_keys.txt`                                                  |
+| Keys file    | `data/nvda_data/keys.txt`                                                      |
 | Key prefix   | `nvapi-`                                                                          |
 | Email script | `nvidia/scripts/agentmail.py` (AgentMail API)                                     |
 | Scheduler    | `nvidia/scripts/main.py` (runs directly)                                          |
@@ -263,9 +263,9 @@ data/
 │   ├── orchestrator.log       # Automation log
 │   ├── agentmail.log          # Email API log
 │   └── signup.log             # Signup automation log
-├── nvidia_data/
-│   ├── nvda_keys.txt          # NVIDIA API keys (nvapi-…)
-│   └── .agentmail_state.json  # AgentMail inbox state
+├── nvda_data/
+│   ├── keys.txt          # NVIDIA API keys (nvapi-…)
+│   └── dead_keys.txt     # Retired NVIDIA keys
 ├── huggingface_data/
 │   ├── hf_keys.txt            # HuggingFace API keys (hf_…)
 │   ├── .agentmail_state.json  # AgentMail inbox state
@@ -464,7 +464,10 @@ atlas/
 │   ├── firefox_profiles/          # Browser profiles
 │   ├── stealth-extension/         # Chrome extension (manifest, background.js, content.js)
 │   ├── openrouter_data/           # Keys, state, logs
-│   ├── nvidia_data/               # Keys, state
+├── nvidia/
+│       ├── config.py              # NVIDIA config + paths
+│       └── scripts/               # main.py, agentmail.py, get_cookie.py, etc.
+│   ├── nvda_data/               # Keys, state
 │   ├── huggingface_data/          # Keys, state, logs
 │   └── proxy_data/                # Prompt override
 ├── .env                           # AGENTMAIL_API_KEY, ATLAS_PROXY_URL

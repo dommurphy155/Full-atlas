@@ -26,11 +26,13 @@ from .config import (
     LISTEN_PORT,
     LOG_LEVEL,
     PROVIDER,
-    HF_MODEL,
     HF_KEY_FILE,
-    OPENROUTER_MODEL,
+    NV_KEY_FILE,
     SYSTEM_PROMPT_OVERRIDE_FILE,
+    get_default_model,
     get_force_default_model,
+    get_key_file,
+    get_key_prefix,
     reload_system_prompt_override,
     migrate_hf_active_keys,
     log,
@@ -64,6 +66,8 @@ def _load_provider_keys() -> list[str]:
     """
     if PROVIDER == "huggingface":
         return load_keys(HF_KEY_FILE)
+    if PROVIDER == "nvidia":
+        return load_keys(NV_KEY_FILE)
     return load_keys(KEY_FILE)
 
 
@@ -76,6 +80,8 @@ def _reload_keys_for_provider() -> list[str]:
     OpenRouter fallback file when the primary is empty."""
     if PROVIDER == "huggingface":
         return _load_provider_keys()
+    if PROVIDER == "nvidia":
+        return load_keys(NV_KEY_FILE)
     # OpenRouter: use fallback if primary is empty (existing behaviour)
     keys = load_keys(KEY_FILE)
     if not keys:
@@ -119,9 +125,10 @@ async def lifespan(app: FastAPI):
 
     if not keys:
         log.warning(
-            "No keys found yet. Expected file: %s (one sk-or-… key per line). "
+            "No keys found yet. Expected file: %s (one %s key per line). "
             "Proxy will start and auto-load keys as they become available.",
-            HF_KEY_FILE if PROVIDER == "huggingface" else KEY_FILE,
+            get_key_file(),
+            get_key_prefix(),
         )
         keys = []  # Start with empty pool, will be populated
 
@@ -130,7 +137,7 @@ async def lifespan(app: FastAPI):
     pool = KeyPool(keys, mode=pool_mode) if keys else KeyPool([], mode=pool_mode)
 
     # For OpenRouter, preserve existing fallback behavior
-    if PROVIDER != "huggingface" and not keys:
+    if PROVIDER == "openrouter" and not keys:
         fallback_keys = load_keys(FALLBACK_KEY_FILE)
         if fallback_keys:
             log.warning(
@@ -155,7 +162,7 @@ async def lifespan(app: FastAPI):
         pool.stats()["total"],
         pool.stats()["healthy"],
         PROVIDER,
-        HF_MODEL if PROVIDER == "huggingface" else OPENROUTER_MODEL,
+        get_default_model(),
         get_force_default_model(),
     )
     yield
@@ -192,10 +199,7 @@ async def _reload_keys_periodically(pool: KeyPool) -> None:
                     reload_system_prompt_override()
 
             # Provider-specific key file
-            if PROVIDER == "huggingface":
-                key_file_path = HF_KEY_FILE
-            else:
-                key_file_path = KEY_FILE
+            key_file_path = get_key_file()
 
             key_file = Path(key_file_path)
             if not key_file.exists():

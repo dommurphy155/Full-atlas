@@ -7,10 +7,11 @@ Logging is initialised in ``logger.py`` on import.  Use
 Quick reference (env vars):
     Default model (OR)          ATLAS_OPENROUTER_MODEL
     Default model (HF)          ATLAS_HF_MODEL
+    Default model (NV)          ATLAS_NV_MODEL
     Force default (global)      FORCE_DEFAULT_MODEL=0|1
     Force default (per)         FORCE_DEFAULT_MODEL_OR / _HF
     Listen host / port          LISTEN_HOST / LISTEN_PORT
-    Key file overrides          ATLAS_OPENROUTER_KEYS_FILE / ATLAS_HF_KEYS_FILE
+    Key file overrides          ATLAS_OPENROUTER_KEYS_FILE / ATLAS_HF_KEYS_FILE / ATLAS_NV_KEYS_FILE
     Runtime config file         data/proxy_data/runtime_provider.json
     System prompt override      data/proxy_data/prompt_override.txt
 """
@@ -144,9 +145,33 @@ HF_CONFIG = ProviderConfig(
     key_label="HuggingFace",
 )
 
+# NVIDIA provider
+NV_BASE_URL: str = _env(
+    "ATLAS_NV_BASE_URL", "https://integrate.api.nvidia.com/v1"
+)
+NV_KEY_PREFIX: str = "nvapi-"
+NV_KEY_FILE: str = _env(
+    "ATLAS_NV_KEYS_FILE", str(_root_dir / "data" / "nvda_data" / "keys.txt")
+)
+NV_DEAD_KEYS_FILE: str = _env(
+    "ATLAS_NV_DEAD_KEYS_FILE", str(_root_dir / "data" / "nvda_data" / "dead_keys.txt")
+)
+NV_DEFAULT_MODEL: str = _env("ATLAS_NV_MODEL", "nvidia/llama-3.3-70b-instruct")
+
+NVIDIA_CONFIG = ProviderConfig(
+    name="nvidia",
+    base_url=NV_BASE_URL,
+    key_prefix=NV_KEY_PREFIX,
+    default_model=NV_DEFAULT_MODEL,
+    key_file=NV_KEY_FILE,
+    dead_keys_file=NV_DEAD_KEYS_FILE,
+    key_label="NVIDIA",
+)
+
 PROVIDERS: dict[str, ProviderConfig] = {
     "openrouter": OPENROUTER_CONFIG,
     "huggingface": HF_CONFIG,
+    "nvidia": NVIDIA_CONFIG,
 }
 
 
@@ -156,10 +181,12 @@ PROVIDERS: dict[str, ProviderConfig] = {
 # atlas restart                     → OpenRouter (default)
 # atlas restart --huggingface       → Hugging Face
 # atlas restart --huggingface --M   → Hugging Face (M)
+# atlas restart --nvidia            → NVIDIA
+# atlas restart --nvidia <M>        → NVIDIA (model <M>)
 def _load_runtime_provider() -> str:
     """Read provider from runtime config file (written by the Atlas CLI).
 
-    Returns ``openrouter`` or ``huggingface``.
+    Returns ``openrouter``, ``huggingface``, or ``nvidia``.
     Falls back to ``ATLAS_PROVIDER`` env var, then ``openrouter``.
     """
     try:
@@ -169,8 +196,12 @@ def _load_runtime_provider() -> str:
         if p.is_file():
             data = _json.loads(p.read_text(encoding="utf-8"))
             provider = data.get("provider", "").lower()
-            if provider in ("huggingface", "hf", "openrouter", "or"):
-                return "huggingface" if provider in ("huggingface", "hf") else "openrouter"
+            if provider in ("huggingface", "hf"):
+                return "huggingface"
+            if provider in ("nvidia", "nv"):
+                return "nvidia"
+            if provider in ("openrouter", "or"):
+                return "openrouter"
     except Exception as e:
         log.warning("Failed to load runtime provider from %s: %s", RUNTIME_PROVIDER_FILE, e)
     return _env("ATLAS_PROVIDER", "openrouter")
@@ -193,7 +224,7 @@ def _load_runtime_model() -> Optional[str]:
 
 
 PROVIDER: str = _load_runtime_provider()
-"""Active provider: ``openrouter`` (default) or ``huggingface``.
+"""Active provider: ``openrouter`` (default), ``huggingface``, or ``nvidia``.
 
 Determined at import time from the runtime config file written by the
 Atlas CLI.  ``get_provider()`` / ``get_provider_config()`` are the
@@ -220,6 +251,9 @@ HF_DEFAULT_MODEL: str = _env("ATLAS_HF_MODEL", "deepseek-ai/DeepSeek-V4-Flash:de
 HF_MODEL: str = _load_runtime_model() or HF_DEFAULT_MODEL
 """Resolved HF model: runtime config → env → built-in default."""
 
+NV_MODEL: str = _load_runtime_model() or NV_DEFAULT_MODEL
+"""Resolved NVIDIA model: runtime config → env → built-in default."""
+
 
 # ---------------------------------------------------------------------------
 # Model override flags — per-provider, with backwards-compatible global
@@ -238,6 +272,10 @@ FORCE_DEFAULT_MODEL_HF: bool = _env_bool("FORCE_DEFAULT_MODEL_HF", FORCE_DEFAULT
 """When True, override the client-sent model with ``HF_MODEL``.
 Takes precedence over the global flag when this env var is explicitly set."""
 
+FORCE_DEFAULT_MODEL_NV: bool = _env_bool("FORCE_DEFAULT_MODEL_NV", FORCE_DEFAULT_MODEL)
+"""When True, override the client-sent model with ``NV_MODEL``.
+Takes precedence over the global flag when this env var is explicitly set."""
+
 
 def get_force_default_model() -> bool:
     """Return the force-override flag for the *active* provider.
@@ -248,11 +286,13 @@ def get_force_default_model() -> bool:
     """
     if PROVIDER == "huggingface":
         return FORCE_DEFAULT_MODEL_HF
+    if PROVIDER == "nvidia":
+        return FORCE_DEFAULT_MODEL_NV
     return FORCE_DEFAULT_MODEL_OR
 
 
 def get_provider() -> str:
-    """Return the active provider: ``openrouter`` or ``huggingface``."""
+    """Return the active provider: ``openrouter``, ``huggingface``, or ``nvidia``."""
     return PROVIDER
 
 
@@ -263,17 +303,40 @@ def get_provider_config(name: Optional[str] = None) -> ProviderConfig:
     return PROVIDERS.get(name, OPENROUTER_CONFIG)
 
 
+# Providers whose upstream API is OpenAI-format (need Anthropic↔OpenAI
+# response translation on the /messages endpoint). OpenRouter has a native
+# Anthropic-compatible /messages endpoint and does not need translation.
+_OPENAI_COMPATIBLE_PROVIDERS: frozenset[str] = frozenset({"huggingface", "nvidia"})
+
+
+def provider_is_openai_compatible(name: Optional[str] = None) -> bool:
+    """True if *name* (defaults to active provider) uses an OpenAI-format API.
+
+    Such providers expose only ``/chat/completions`` (no native Anthropic
+    /messages endpoint), so responses must be translated Anthropic↔OpenAI.
+    """
+    if name is None:
+        name = PROVIDER
+    return name in _OPENAI_COMPATIBLE_PROVIDERS
+
+
 def get_chat_url() -> str:
     """Upstream chat/completions URL for the active provider."""
     if PROVIDER == "huggingface":
         return HF_CONFIG.chat_url
+    if PROVIDER == "nvidia":
+        return NVIDIA_CONFIG.chat_url
     return OPENROUTER_CHAT
 
 
 def get_messages_url() -> str:
-    """Upstream messages URL for the active provider."""
-    if PROVIDER == "huggingface":
-        return HF_CONFIG.chat_url
+    """Upstream messages URL for the active provider.
+
+    Only OpenRouter exposes a native /messages endpoint; HF and NVIDIA are
+    OpenAI-compatible, so they reuse the chat/completions URL (see get_chat_url).
+    """
+    if PROVIDER in ("huggingface", "nvidia"):
+        return get_chat_url()
     return OPENROUTER_MESSAGES
 
 
@@ -281,6 +344,8 @@ def get_models_url() -> str:
     """Upstream models URL for the active provider."""
     if PROVIDER == "huggingface":
         return HF_CONFIG.models_url
+    if PROVIDER == "nvidia":
+        return NVIDIA_CONFIG.models_url
     return OPENROUTER_MODELS
 
 
@@ -288,6 +353,8 @@ def get_default_model() -> str:
     """Default model for the active provider."""
     if PROVIDER == "huggingface":
         return HF_MODEL
+    if PROVIDER == "nvidia":
+        return NV_MODEL
     return OPENROUTER_MODEL
 
 
@@ -295,6 +362,8 @@ def get_key_file() -> str:
     """Key file path for the active provider."""
     if PROVIDER == "huggingface":
         return HF_KEY_FILE
+    if PROVIDER == "nvidia":
+        return NV_KEY_FILE
     return KEY_FILE
 
 
@@ -307,6 +376,8 @@ def get_key_prefix() -> str:
     """Key prefix for the active provider."""
     if PROVIDER == "huggingface":
         return HF_KEY_PREFIX
+    if PROVIDER == "nvidia":
+        return NV_KEY_PREFIX
     return "sk-"
 
 
@@ -351,8 +422,17 @@ PREWARM_INTERVAL: float = _env_float("PREWARM_INTERVAL", 300.0)
 # ---------------------------------------------------------------------------
 MAX_RETRIES: int = _env_int("ATLAS_PROXY_MAX_RETRIES", _env_int("MAX_RETRIES", 5))
 RETRY_STATUSES: frozenset[int] = frozenset(
-    {408, 409, 423, 425, 429, 499, 500, 502, 503, 504, 507, 524, 529}
+    {408, 409, 423, 425, 429, 499, 500, 502, 503, 504, 507, 524, 529, 402}
 )
+"""Statuses worth rotating to another key for.
+
+402 (Payment Required) is included because the error is PER-KEY on
+OpenRouter: a key whose account is out of credits 402s while other keys
+in the pool are still funded. Retrying rotates to the next key instead
+of failing the request on the first key picked. 402 is not a
+context-length or overload condition, so it maps to its own status and
+never gets collapsed into 429.
+"""
 STREAM_FIRST_BYTE_TIMEOUT: float = _env_float("STREAM_FIRST_BYTE_TIMEOUT", 20.0)
 PROXY_KEEPALIVE_SECONDS: float = _env_float("ATLAS_PROXY_KEEPALIVE_SECONDS", 15.0)
 
@@ -490,6 +570,13 @@ PAYLOAD_DIR: str = _env("ATLAS_PAYLOAD_DIR", "/tmp/atlas_payloads")
 LOG_LEVEL: str = _env("LOG_LEVEL", "INFO")
 LOG_JSON: bool = _env_bool("LOG_JSON", False)
 LOG_REQUEST_ID: bool = _env_bool("LOG_REQUEST_ID", True)
+
+# Reasoning message normalization mode (for Claude Code payloads where
+# assistant messages carry both `reasoning` and `reasoning_content`).
+# dedupe: keep `reasoning`, drop `reasoning_content` when both present
+# strip:  drop both from assistant messages
+# passthrough: leave messages untouched
+REASONING_MODE: str = _env("ATLAS_REASONING_MODE", "dedupe")
 
 
 # ---------------------------------------------------------------------------
@@ -703,15 +790,18 @@ __all__ = [
     "SYSTEM_PROMPT_OVERRIDE_FILE",
     "KEY_FILE", "FALLBACK_KEY_FILE",
     "HF_KEY_FILE", "HF_DEAD_KEYS_FILE",
+    "NV_KEY_FILE", "NV_DEAD_KEYS_FILE",
     # Provider registry
     "ProviderConfig", "PROVIDERS",
-    "PROVIDER", "get_provider", "get_provider_config",
+    "PROVIDER", "get_provider", "get_provider_config", "provider_is_openai_compatible",
     "OPENROUTER_BASE_URL", "OPENROUTER_CHAT", "OPENROUTER_MESSAGES",
     "OPENROUTER_MODELS",
     "OPENROUTER_MODEL", "OPENROUTER_CONFIG",
     "HF_BASE_URL", "HF_DEFAULT_MODEL", "HF_MODEL", "HF_KEY_PREFIX", "HF_CONFIG",
+    "NV_BASE_URL", "NV_KEY_PREFIX", "NV_DEFAULT_MODEL", "NV_MODEL", "NVIDIA_CONFIG",
     # Model override
     "FORCE_DEFAULT_MODEL", "FORCE_DEFAULT_MODEL_OR", "FORCE_DEFAULT_MODEL_HF",
+    "FORCE_DEFAULT_MODEL_NV",
     "get_force_default_model",
     # URL / model / key resolution
     "get_chat_url", "get_messages_url", "get_models_url",

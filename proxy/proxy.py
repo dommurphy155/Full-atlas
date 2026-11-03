@@ -623,6 +623,14 @@ class ProxyCore:
             await self.pool.mark_error(key_idx, status)
             # Check for HF permanent retirement conditions (non-streaming pre-response)
             pl.trace(request_id).upstream(key_idx, status)  # logging-only
+            # Log the rejected status explicitly. Without this line a
+            # pre-stream upstream rejection (402, 400, 404, ...) produced
+            # only the "▶ <rid> ... STREAM" start line and no status
+            # line at all, so the failure was invisible in the logs.
+            log.warning(
+                "req=%s key_idx=%d upstream rejected status=%d stream=1",
+                request_id, key_idx, status,
+            )
             if self.provider == "huggingface":
                 data = await upstream.aread()
                 if is_hf_rate_limit_error(status, data) or is_hf_key_invalid(status, data):

@@ -13,6 +13,7 @@ from .config import (
     COOLDOWN_BASE_SECONDS,
     COOLDOWN_MAX_SECONDS,
     HF_KEY_PREFIX,
+    NV_KEY_PREFIX,
     MAX_CONSECUTIVE_ERRORS,
     MAX_CONCURRENT_PER_KEY,
     RETRY_STATUSES,
@@ -428,7 +429,7 @@ class KeyPool:
         return out
 
 
-_KEY_PREFIXES = ("sk-", "sk-ant-", "sk-proj-", "sk-openai-", HF_KEY_PREFIX)
+_KEY_PREFIXES = ("sk-", "sk-ant-", "sk-proj-", "sk-openai-", HF_KEY_PREFIX, NV_KEY_PREFIX)
 
 
 def load_keys(path: str) -> List[str]:

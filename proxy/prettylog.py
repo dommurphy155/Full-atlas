@@ -165,6 +165,7 @@ _PROVIDER_SHORT = {
     "anthropic": "ANTHROPIC",
     "huggingface": "HF",
     "openrouter": "OPENROUTER",
+    "nvidia": "NV",
 }
 
 
