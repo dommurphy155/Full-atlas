@@ -1137,6 +1137,26 @@ async def messages(request: Request) -> Response:
         ):
             openai_data = loads(resp.body)
             anthropic_data = openai_response_to_anthropic(openai_data, rid=rid)
+            if not anthropic_data.get("content"):
+                # Upstream produced nothing. Surface an explicit error so
+                # the client does not record an empty assistant turn and
+                # synthesize a "your previous response had no visible
+                # output" nudge.
+                log.warning(
+                    "req=%s non-streaming OpenAI response had no visible content — returning 502",
+                    rid,
+                )
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": "Upstream produced no output; retry the turn",
+                        },
+                    },
+                    headers={"x-request-id": rid},
+                )
             new_body = dumps(anthropic_data)
             return Response(
                 content=new_body,
@@ -1187,6 +1207,7 @@ async def _stream_openai_to_anthropic(rid: str, upstream_url: str, payload: byte
             "tool_blocks": {},
         }
         emitted_any = False
+        terminal_seen = False
 
         # Stream from upstream (proxy.iter_upstream_sse or proxy.forward already returned a StreamingResponse)
         async for raw in resp.body_iterator:
@@ -1243,10 +1264,10 @@ async def _stream_openai_to_anthropic(rid: str, upstream_url: str, payload: byte
             ):
                 if evt_data is None:
                     continue
-                # Terminal finish_reason events are only meaningful if real
-                # output was produced. Buffer them when nothing has been
-                # emitted yet so a zero-output turn yields exactly one
-                # terminal outcome (the error below), never both.
+                # A message_delta represents the upstream finish_reason.
+                if evt_name == "message_delta":
+                    terminal_seen = True
+                # Never report a successful completion for an empty response.
                 if evt_name == "message_delta" and not emitted_any:
                     continue
                 # Only real output counts as visible content. Scaffolding
@@ -1262,27 +1283,28 @@ async def _stream_openai_to_anthropic(rid: str, upstream_url: str, payload: byte
                         emitted_any = True
                 yield _sse_event(evt_name, evt_data)
 
-        if not emitted_any:
-            # Upstream produced zero visible output. Close the scaffolding
-            # block first so the event stream is well-formed, then surface
-            # an explicit error instead of a clean empty turn — an empty
-            # successful assistant message makes the client synthesize a
-            # "your previous response had no visible output" nudge,
-            # which then loops through every later turn.
+        if not emitted_any or not terminal_seen:
+            # An upstream EOF without finish_reason is an interrupted
+            # response, not a successful assistant turn.
             yield _sse_event("content_block_stop", {
                 "type": "content_block_stop",
                 "index": 0,
             })
+            message = (
+                "Upstream produced no output; retry the turn"
+                if not emitted_any
+                else "Upstream stream ended before completion; retry the turn"
+            )
             yield _sse_event("error", {
                 "type": "error",
                 "error": {
                     "type": "api_error",
-                    "message": "Upstream produced no output; retry the turn",
+                    "message": message,
                 },
             })
             return
 
-        # Close events
+        # Only send message_stop after an actual upstream finish_reason.
         yield _sse_event("content_block_stop", {
             "type": "content_block_stop",
             "index": 0,
