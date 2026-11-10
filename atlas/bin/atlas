@@ -147,7 +147,7 @@ def _daemon_name(service):
             return name
     return None
 
-def service_action(action, service=None):
+def service_action(action, service=None, quiet=False):
     service = service or get_service_name()
     if not has_systemctl():
         # No systemd (macOS / minimal Linux): manage via atlas_core daemons.
@@ -162,14 +162,16 @@ def service_action(action, service=None):
             CONSOLE.print(red(f"ERR: {action} {service} failed: {e}"))
             return False
         if ok:
-            CONSOLE.print(green(f"OK: {action} {service} (daemon mode)"))
+            if not quiet:
+                CONSOLE.print(green(f"OK: {action} {service} (daemon mode)"))
         else:
             CONSOLE.print(red(f"ERR: {action} {service} failed"))
         return bool(ok)
     cmd = ["systemctl", action, service]
     result = _run(cmd, check=False, capture=True)
     if result.returncode == 0:
-        CONSOLE.print(green(f"OK: {action} {service}"))
+        if not quiet:
+            CONSOLE.print(green(f"OK: {action} {service}"))
         return True
     else:
         CONSOLE.print(red(f"ERR: {action} {service} failed (exit {result.returncode})"))
@@ -248,9 +250,7 @@ def cmd_proxy_restart(provider: str = "openrouter", model: str = ""):
     CONSOLE.print(f"{cyan('▶')} Restarting Atlas proxy..." + (f" [{provider}]" + (f" ({model})" if model else "") if provider != "openrouter" else ""))
     # Write runtime provider config before restart
     _write_runtime_provider(provider, model)
-    cmd_proxy_stop()
-    time.sleep(1)
-    return cmd_proxy_start()
+    return 0 if service_action("restart", "atlas-proxy", quiet=True) else 1
 
 PROXY_LOG_FILE = PROJECT_ROOT / "proxy" / "logs" / "atlas-proxy.log"
 
@@ -785,7 +785,7 @@ def main() -> int:
             while _i < len(_args):
                 _arg = _args[_i]
 
-                elif _arg in ("--openrouter", "--or"):
+                if _arg in ("--openrouter", "--or"):
                     _provider = "openrouter"
 
                     # OpenRouter uses config.py default unless explicitly
